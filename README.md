@@ -1,10 +1,6 @@
 Njuskalo Scraping Pipeline - README
 # 🏠 Njuskalo Scraping Pipeline
 
-[![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/release/python-390/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-![Last Commit](https://img.shields.io/github/last-commit/FraneCal/njuskalo-scraper)
-
 A complete automated pipeline for scraping and parsing real estate data from **[Njuskalo.hr](https://www.njuskalo.hr/)**.  
 This project is designed for **data collection, research, and analysis** purposes, with full support for resuming, skipping, and modular execution of each pipeline step.
 
@@ -12,7 +8,7 @@ This project is designed for **data collection, research, and analysis** purpose
 
 ## 📦 Requirements
 
-- **Python**: 3.9+  
+- **Python**: 3.8+  
 - **OS**: Linux, macOS, Windows  
 - **Dependencies**: listed in `requirements.txt`  
 
