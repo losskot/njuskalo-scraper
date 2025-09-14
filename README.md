@@ -1,4 +1,3 @@
-Njuskalo Scraping Pipeline - README
 # 🏠 Njuskalo Scraping Pipeline
 
 A complete automated pipeline for scraping and parsing real estate data from **[Njuskalo.hr](https://www.njuskalo.hr/)**.  
