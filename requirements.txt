@@ -1,0 +1,11 @@
+aiofiles
+asyncio
+beautifulsoup4
+colorama
+curl_cffi
+requests
+lxml
+python-dateutil
+tqdm
+playwright 
+playwright-stealth

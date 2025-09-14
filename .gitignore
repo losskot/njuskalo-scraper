@@ -1,0 +1,38 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+
+# Backend folder with scraped data
+backend/
+
+# Log files
+*.log
+
+# Database files
+*.db
+
+# JSON output files
+*.json
+
+# HTML scraped files
+*.html
+
+# Temporary files
+*.tmp
+*.temp
+
+# Environment files
+.env
+.env.local
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python virtual environment
+venv/
+env/
+.virtualenv/
