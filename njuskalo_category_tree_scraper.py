@@ -312,23 +312,23 @@ COOKIES = {
 
 # --- Category list to scrape ---
 CATEGORIES = [
-    # "prodaja-kuca",
-    # "iznajmljivanje-kuca",
-    # "prodaja-stanova",
-    # "iznajmljivanje-stanova",
-    # "prodaja-zemljista",
-    # "zakup-zemljista",
-    # "prodaja-poslovnih-prostora",
-    # "iznajmljivanje-poslovnih-prostora",
-    "novogradnja",                                    # currently running only for this category for testing. uncomment all to test for full run.
-    # "vikendice",
-    # "montazni-objekti",
-    # "prodaja-luksuznih-nekretnina",
-    # "iznajmljivanje-luksuznih-nekretnina",
-    # "prodaja-garaza",
-    # "iznajmljivanje-garaza",
-    # "iznajmljivanje-soba",
-    # "cimeri"
+    "prodaja-kuca",
+    "iznajmljivanje-kuca",
+    "prodaja-stanova",
+    "iznajmljivanje-stanova",
+    "prodaja-zemljista",
+    "zakup-zemljista",
+    "prodaja-poslovnih-prostora",
+    "iznajmljivanje-poslovnih-prostora",
+    "novogradnja",
+    "vikendice",
+    "montazni-objekti",
+    "prodaja-luksuznih-nekretnina",
+    "iznajmljivanje-luksuznih-nekretnina",
+    "prodaja-garaza",
+    "iznajmljivanje-garaza",
+    "iznajmljivanje-soba",
+    "cimeri"
 ]
 
 
