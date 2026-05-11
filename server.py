@@ -15,6 +15,7 @@ Usage:
 import json
 import os
 import sqlite3
+from datetime import datetime
 
 from flask import Flask, request, jsonify, send_from_directory
 
@@ -28,6 +29,23 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
+
+
+def parse_available_from(s):
+    """Parse Croatian-format date strings like '01.06.2026.' or '1.5.2026.' into a date."""
+    if not s:
+        return None
+    s = s.strip().rstrip('.')
+    parts = s.split('.')
+    if len(parts) >= 3:
+        try:
+            day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+            if year < 100:
+                year += 2000
+            return datetime(year, month, day)
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 # ─── Static viewer ────────────────────────────────────────────────────────────
@@ -117,11 +135,18 @@ def api_listings():
     limit = request.args.get("limit", 500, type=int)
     offset = request.args.get("offset", 0, type=int)
 
-    # Count total matching
+    # Availability date filter (parsed in Python due to mixed text formats)
+    avail_after_str = request.args.get("avail_after")   # ISO date: YYYY-MM-DD
+    avail_before_str = request.args.get("avail_before")  # ISO date: YYYY-MM-DD
+    avail_after = datetime.fromisoformat(avail_after_str) if avail_after_str else None
+    avail_before = datetime.fromisoformat(avail_before_str) if avail_before_str else None
+
+    # Count total matching (without date filter — date filter is post-SQL)
     count_row = conn.execute(f"SELECT COUNT(*) FROM listings WHERE {where}", params).fetchone()
     total = count_row[0]
 
-    # Fetch listings
+    # Fetch listings (use higher limit when date filter active to compensate for post-SQL filtering)
+    fetch_limit = limit * 4 if (avail_after or avail_before) else limit
     rows = conn.execute(
         f"SELECT id, title, price, price_eur, location, lat, lng, rooms, area_m2, "
         f"street, phone, has_bathtub, no_agency_fee, has_washing_machine, "
@@ -129,11 +154,18 @@ def api_listings():
         f"agency_name, furnishing "
         f"FROM listings WHERE {where} ORDER BY price_eur ASC NULLS LAST "
         f"LIMIT ? OFFSET ?",
-        params + [limit, offset],
+        params + [fetch_limit, offset],
     ).fetchall()
 
     listings = []
     for r in rows:
+        # Apply availability date filter in Python
+        if avail_after or avail_before:
+            avail_dt = parse_available_from(r["available_from"])
+            if avail_after and (avail_dt is None or avail_dt < avail_after):
+                continue
+            if avail_before and (avail_dt is None or avail_dt > avail_before):
+                continue
         listings.append({
             "id": r["id"],
             "title": r["title"],

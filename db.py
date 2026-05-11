@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS listings (
     -- AI enrichment (set by ai_enrich.py)
     no_agency_fee       INTEGER,
     has_bathtub         INTEGER,
+    description_uk      TEXT,
     ai_enriched_at      TEXT,
     -- Metadata
     scraped_at          TEXT
@@ -166,6 +167,7 @@ def init_db():
         ("heating_type", "TEXT"),
         ("no_agency_fee", "INTEGER"),
         ("has_bathtub", "INTEGER"),
+        ("description_uk", "TEXT"),
         ("ai_enriched_at", "TEXT"),
         ("scraped_at", "TEXT"),
     ]

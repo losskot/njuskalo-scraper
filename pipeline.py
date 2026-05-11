@@ -38,13 +38,20 @@ logging.basicConfig(
 )
 
 
+# Default price filter for scraping (EUR)
+DEFAULT_PRICE_MIN = 300
+DEFAULT_PRICE_MAX = 1200
+
+
 class PipelineRunner:
-    def __init__(self, skip_existing=False):
+    def __init__(self, skip_existing=False, price_min=None, price_max=None):
         self.skip_existing = skip_existing
+        self.price_min = price_min
+        self.price_max = price_max
         self.start_time = time.time()
         self.step_times = {}
 
-    def run_script(self, script_name, step_num, description):
+    def run_script(self, script_name, step_num, description, extra_args=None):
         """Run a Python script with live output streaming."""
         logging.info("=" * 60)
         logging.info(f"STEP {step_num}: {description}")
@@ -54,9 +61,11 @@ class PipelineRunner:
         step_start = time.time()
         last_stderr = ""
 
+        cmd = [sys.executable, "-u", script_name] + (extra_args or [])
+
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-u", script_name],
+                cmd,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace',
             )
@@ -111,10 +120,15 @@ class PipelineRunner:
         if self.skip_existing and self._db_has_rows("listings", 10):
             logging.info("⏭️  STEP 2 SKIPPED: listings table already has data")
             return True
-        return self.run_script(
-            'scrape_and_parse.py', 2,
-            'Download HTML → parse → fetch phone → insert into DB'
-        )
+        extra = []
+        if self.price_min is not None:
+            extra += ["--price-min", str(self.price_min)]
+        if self.price_max is not None:
+            extra += ["--price-max", str(self.price_max)]
+        desc = 'Download HTML → parse → fetch phone → insert into DB'
+        if extra:
+            desc += f' (price: {self.price_min or "*"}–{self.price_max or "*"}€)'
+        return self.run_script('scrape_and_parse.py', 2, desc, extra_args=extra)
 
     def step3_ai_enrich(self):
         """Step 3: AI enrichment (agency fee, appliances, bathtub)."""
@@ -215,9 +229,17 @@ def main():
                         help='Run specific step only (1-3)')
     parser.add_argument('--skip-existing', action='store_true',
                         help='Skip steps if output already exists in DB')
+    parser.add_argument('--price-min', type=int, default=DEFAULT_PRICE_MIN,
+                        help=f'Min price filter in EUR (default: {DEFAULT_PRICE_MIN})')
+    parser.add_argument('--price-max', type=int, default=DEFAULT_PRICE_MAX,
+                        help=f'Max price filter in EUR (default: {DEFAULT_PRICE_MAX})')
     args = parser.parse_args()
 
-    runner = PipelineRunner(skip_existing=args.skip_existing)
+    runner = PipelineRunner(
+        skip_existing=args.skip_existing,
+        price_min=args.price_min,
+        price_max=args.price_max,
+    )
 
     try:
         if args.step:

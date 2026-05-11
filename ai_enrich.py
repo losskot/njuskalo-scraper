@@ -66,30 +66,57 @@ log = logging.getLogger("ai_enrich")
 # ─── Prompts ──────────────────────────────────────────────────────────────────
 
 TEXT_ENRICHMENT_PROMPT = """\
-You are analyzing a Croatian real estate rental listing. Below are the values we extracted automatically. Your task is to CONFIRM, CORRECT, or FILL IN missing values.
+You are analyzing a Croatian real estate rental listing.
 
-Review the listing description and all provided data. Determine:
+You will receive:
+- Listing metadata (title, location, price, poster name)
+- Our automated boolean extractions (confirm or correct)
+- **Structured tags from the website** — these are AUTHORITATIVE data entered by the poster via dropdowns/checkboxes. Always trust tags over free-text description when they conflict.
+- Free-text description
 
-1. **no_agency_fee** (boolean): Is this listing explicitly free of agency fee/commission?
-   Positive signals: "bez provizije", "bez agencijske provizije", "bez posredničke naknade", "provizija 0%", "nema provizije", "bez posredovanja", "direktno od vlasnika", "vlasnik izdaje".
-   If there IS an agency (naziv_agencije present) and NO "bez provizije" mention → false.
-   If no agency and no mention → true (private owner).
+Determine each field using the rules below:
 
-2. **has_washing_machine** (boolean): Does the listing have a washing machine?
-   Look for: "perilica rublja", "perilicom rublja", "perilica-sušilica", "perilicom-sušilicom", "washing machine".
+1. **no_agency_fee** (boolean): Is this listing free of agency commission for the tenant?
+   PRIORITY ORDER (use the FIRST match):
+   a. If tags contain "Agencijska provizija: Najmoprimac ne plaća agencijsku proviziju" → true
+   b. If description contains: "bez provizije", "bez agencijske provizije", "bez posredničke naknade", "provizija 0%", "nema provizije", "bez posredovanja", "direktno od vlasnika", "vlasnik izdaje", "agencije isključene" → true
+   c. If tags explicitly state a commission amount or percentage → false
+   d. If poster name looks like a real estate agency (contains "nekretnine", "d.o.o.", "j.d.o.o.", "obrt") → false
+   e. Otherwise → true (assume private owner)
+   NOTE: The "Agency" field below is the poster's username, NOT necessarily a real estate agency.
 
-3. **has_dishwasher** (boolean): Does the listing have a dishwasher?
-   Look for: "perilica posuđa", "perilicom posuđa", "dishwasher", "sudomašina".
+2. **has_washing_machine** (boolean or null):
+   - If tags list "Perilica rublja" or "Perilica-sušilica" → true
+   - If description mentions: "perilica rublja", "perilicom rublja", "perilica-sušilica", "washing machine" → true
+   - If enough detail is given but no mention → false
+   - If description is too short to tell → null
 
-4. **has_air_conditioning** (boolean): Does the listing have air conditioning/climate?
-   Look for: "klima", "klima uređaj", "klimatiziran", "air conditioning", "AC".
+3. **has_dishwasher** (boolean or null):
+   - If tags list "Perilica posuđa" → true
+   - If description mentions: "perilica posuđa", "perilicom posuđa", "dishwasher", "sudomašina" → true
+   - If enough detail is given but no mention → false
+   - If description is too short to tell → null
 
-5. **heating_type** (string or null): What heating system does the listing have?
-   Look for: "centralno", "plinsko", "toplana", "gradska toplana", "etažno", "električno", "radijatori", "podno grijanje".
-   Return the Croatian term as found.
+4. **has_air_conditioning** (boolean or null):
+   - If tags contain "Klima uređaj: Da" → true
+   - If description mentions: "klima", "klima uređaj", "klimatiziran", "air conditioning" → true
+   - If enough detail is given but no mention → false
+   - If description is too short to tell → null
 
-6. **address** (string): The most specific street address or location.
-   Look for street names, neighborhood names. If none, use district from location field.
+5. **heating_type** (string or null):
+   - If tags contain "Sustav grijanja: ..." → use that value
+   - Otherwise look in description for: "centralno", "plinsko", "toplana", "gradska toplana", "etažno", "električno", "radijatori", "podno grijanje"
+   - Return the Croatian term as found, or null if unknown
+
+6. **address** (string): Extract the most specific street address.
+   - Look for actual street names (ulica, cesta, etc.) in description
+   - If no street name found, use the neighborhood/district from location field
+
+7. **description_uk** (string): Translate the listing description to Ukrainian.
+   - Translate the full description naturally and fluently into Ukrainian
+   - Keep proper nouns (street names, neighborhood names, brand names) as-is
+   - Keep numbers, measurements, and prices as-is
+   - If description is empty, return empty string
 
 Respond ONLY with a JSON object, no markdown fences:
 {
@@ -98,7 +125,8 @@ Respond ONLY with a JSON object, no markdown fences:
   "has_dishwasher": true | false | null,
   "has_air_conditioning": true | false | null,
   "heating_type": "<string or null>",
-  "address": "<string>"
+  "address": "<string>",
+  "description_uk": "<string>"
 }"""
 
 BATHTUB_PROMPT = """\
@@ -234,7 +262,7 @@ def ai_text_enrich(client_holder, model, listing):
     parts = []
     parts.append(f"Title: {listing.get('title', '')}")
     parts.append(f"Location: {listing.get('location', '')}")
-    parts.append(f"Agency: {listing.get('agency_name', 'none')}")
+    parts.append(f"Poster name: {listing.get('agency_name', 'none')}")
     parts.append(f"Price: {listing.get('price', '')}")
 
     # Show what we parsed deterministically
@@ -244,12 +272,15 @@ def ai_text_enrich(client_holder, model, listing):
     parts.append(f"has_air_conditioning: {listing.get('has_air_conditioning')}")
     parts.append(f"heating_type: {listing.get('heating_type')}")
 
-    # Tags
+    # Tags — authoritative structured data from the website
     tags = listing.get("_tags", {})
-    if tags.get("Grijanje"):
-        parts.append(f"\nGrijanje tags: {tags['Grijanje']}")
-    if tags.get("Funkcionalnosti i ostale karakteristike stana"):
-        parts.append(f"Features tags: {tags['Funkcionalnosti i ostale karakteristike stana']}")
+    tag_lines = []
+    for cat, vals in tags.items():
+        for v in vals:
+            tag_lines.append(f"  {cat}: {v}")
+    if tag_lines:
+        parts.append(f"\n--- Structured tags (AUTHORITATIVE — from website dropdowns/checkboxes) ---")
+        parts.extend(tag_lines)
 
     parts.append(f"\n--- Description ---")
     parts.append(listing.get("description", "") or "(no description)")
@@ -263,7 +294,7 @@ def ai_text_enrich(client_holder, model, listing):
             {"role": "user", "content": user_text},
         ],
         response_format={"type": "json_object"},
-        max_completion_tokens=300,
+        max_completion_tokens=2000,
     )
 
     consecutive_429s = 0
@@ -422,9 +453,20 @@ def enrich_listing(client_holder, model, listing_row, skip_vision=False):
             updates["heating_type"] = text_result["heating_type"]
         if "address" in text_result and text_result["address"]:
             updates["street"] = text_result["address"]
+        if "description_uk" in text_result and text_result["description_uk"]:
+            updates["description_uk"] = text_result["description_uk"]
 
-    # 2. Vision (bathtub)
-    if not skip_vision and image_urls:
+    # 2. Vision (bathtub) — skip if tags already provide definitive answer
+    bathtub_from_tags = None
+    feature_tags = tags.get("Funkcionalnosti i ostale karakteristike stana", [])
+    if "Kada" in feature_tags:
+        bathtub_from_tags = True
+    elif any("Tuš" in v for v in feature_tags):
+        bathtub_from_tags = False
+
+    if bathtub_from_tags is not None:
+        updates["has_bathtub"] = 1 if bathtub_from_tags else 0
+    elif not skip_vision and image_urls:
         has_bathtub = ai_vision_bathtub(client_holder, model, image_urls)
         if has_bathtub is not None:
             updates["has_bathtub"] = 1 if has_bathtub else 0

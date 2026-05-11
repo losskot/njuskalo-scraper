@@ -32,6 +32,10 @@ from db import (
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONCURRENT_ENTRIES = 6
 
+# Price filter (set via CLI args, applied to leaf URL pagination)
+PRICE_MIN = None
+PRICE_MAX = None
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -175,56 +179,79 @@ async def refresh_headers_and_cookies():
     return token, cookies
 
 
+_consecutive_blocks = 0
+_block_lock = asyncio.Lock() if hasattr(asyncio, 'Lock') else None
+MAX_CONSECUTIVE_BLOCKS = 5
+
+
+async def _do_fetch(session, url, mode, timeout=10):
+    """Single fetch attempt with the given mode. Returns HTML or raises."""
+    if mode == "azure" and azure_proxy_client.available:
+        status, body, region = await azure_proxy_client.fetch(url, headers=HEADERS, cookies=COOKIES)
+        return body
+    elif mode == "proxy":
+        proxy = get_next_proxy()
+        response = await asyncio.wait_for(
+            session.get(url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110", proxies=proxy),
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return getattr(response, "text", "")
+    else:
+        response = await asyncio.wait_for(
+            session.get(url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110"),
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        return getattr(response, "text", "")
+
+
 async def fetch_html(session, url):
-    """Fetch HTML with connection mode cycling and anti-bot handling."""
-    timeout = 10
+    """Fetch HTML with connection mode cycling, retries, and anti-bot handling."""
+    global _consecutive_blocks
+    ad_id = extract_ad_id_from_url(url) or url[-20:]
     mode = get_connection_mode()
 
+    # Try primary mode
+    text = None
     try:
-        if mode == "azure" and azure_proxy_client.available:
-            status, body, region = await azure_proxy_client.fetch(url, headers=HEADERS, cookies=COOKIES)
-            text = body
-        elif mode == "proxy":
-            proxy = get_next_proxy()
-            response = await asyncio.wait_for(
-                session.get(url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110", proxies=proxy),
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            text = getattr(response, "text", "")
-        else:
-            response = await asyncio.wait_for(
-                session.get(url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110"),
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            text = getattr(response, "text", "")
+        text = await _do_fetch(session, url, mode)
+    except Exception as e:
+        log.warning(f"Fetch error {ad_id} ({mode}): {e}")
 
-        # Block detection with fallbacks
-        if is_blocked(text):
-            if mode != "azure" and azure_proxy_client.available:
-                _, text, _ = await azure_proxy_client.fetch(url, headers=HEADERS, cookies=COOKIES)
-            if is_blocked(text):
-                log.warning(f"Blocked on {extract_ad_id_from_url(url)} — pausing 60s")
-                await asyncio.sleep(60)
-                raise AntibotExit()
+    # If blocked or failed, try fallback modes
+    fallbacks = []
+    if mode != "azure" and azure_proxy_client.available:
+        fallbacks.append("azure")
+    if mode != "proxy" and LOADED_PROXIES:
+        fallbacks.append("proxy")
+    if mode != "local":
+        fallbacks.append("local")
 
+    if text is None or is_blocked(text):
+        for fb in fallbacks:
+            try:
+                text = await _do_fetch(session, url, fb)
+                if text and not is_blocked(text):
+                    break
+            except Exception:
+                continue
+
+    # Final check
+    if text and not is_blocked(text):
+        _consecutive_blocks = 0
         return text
 
-    except AntibotExit:
-        raise
-    except Exception as e:
-        ad_id = extract_ad_id_from_url(url) or url[-20:]
-        log.error(f"Fetch error {ad_id}: {e}")
-        # Azure fallback on error
-        if mode != "azure" and azure_proxy_client.available:
-            try:
-                _, text, _ = await azure_proxy_client.fetch(url, headers=HEADERS, cookies=COOKIES)
-                if not is_blocked(text):
-                    return text
-            except Exception:
-                pass
-        return None
+    # Blocked on all modes
+    _consecutive_blocks += 1
+    log.warning(f"Blocked on {ad_id} (consecutive: {_consecutive_blocks}/{MAX_CONSECUTIVE_BLOCKS})")
+
+    if _consecutive_blocks >= MAX_CONSECUTIVE_BLOCKS:
+        log.error(f"Blocked {MAX_CONSECUTIVE_BLOCKS} times in a row — raising AntibotExit")
+        raise AntibotExit()
+
+    await asyncio.sleep(random.uniform(5, 15))
+    return None
 
 
 # ─── Phone API ────────────────────────────────────────────────────────────────
@@ -441,6 +468,20 @@ async def process_entry(session, entry_url, bearer_token, db_conn):
     return True
 
 
+def _build_leaf_page_url(leaf_url, page):
+    """Build paginated leaf URL with optional price filters."""
+    params = []
+    if PRICE_MIN is not None:
+        params.append(f"price%5Bmin%5D={PRICE_MIN}")
+    if PRICE_MAX is not None:
+        params.append(f"price%5Bmax%5D={PRICE_MAX}")
+    if page > 1:
+        params.append(f"page={page}")
+    if params:
+        return f"{leaf_url}?{'&'.join(params)}"
+    return leaf_url
+
+
 async def process_leaf_url(session, leaf_url, bearer_token, db_conn):
     """Process one leaf URL: paginate, discover entries, scrape each."""
     entry_urls = []
@@ -449,7 +490,7 @@ async def process_leaf_url(session, leaf_url, bearer_token, db_conn):
     prev_page_urls = None
 
     while True:
-        url = leaf_url if page == 1 else f"{leaf_url}?page={page}"
+        url = _build_leaf_page_url(leaf_url, page)
         html = await fetch_html(session, url)
         if not html:
             break
@@ -483,25 +524,44 @@ async def process_leaf_url(session, leaf_url, bearer_token, db_conn):
     sem = asyncio.Semaphore(CONCURRENT_ENTRIES)
     saved = 0
 
+    antibot = False
+
     async def scrape_one(entry_url):
-        nonlocal saved
+        nonlocal saved, antibot
+        if antibot:
+            return
         async with sem:
-            ok = await process_entry(session, entry_url, bearer_token, db_conn)
-            if ok:
-                saved += 1
+            try:
+                ok = await process_entry(session, entry_url, bearer_token, db_conn)
+                if ok:
+                    saved += 1
+            except AntibotExit:
+                antibot = True
+                return
             await asyncio.sleep(random.uniform(0.3, 0.7))
 
     tasks = [scrape_one(u) for u in entry_urls]
     await asyncio.gather(*tasks)
 
+    if antibot:
+        raise AntibotExit()
+
     return saved, len(entry_urls)
 
 
 async def main():
+    global PRICE_MIN, PRICE_MAX
     import argparse
     parser = argparse.ArgumentParser(description="Unified scraper: download + parse + phone → DB")
     parser.add_argument("--restart", action="store_true", help="Ignore checkpoints, start from scratch")
+    parser.add_argument("--price-min", type=int, default=None, help="Min price filter (EUR)")
+    parser.add_argument("--price-max", type=int, default=None, help="Max price filter (EUR)")
     args = parser.parse_args()
+
+    PRICE_MIN = args.price_min
+    PRICE_MAX = args.price_max
+    if PRICE_MIN or PRICE_MAX:
+        log.info(f"Price filter: {PRICE_MIN or '∞'}€ – {PRICE_MAX or '∞'}€")
 
     log.info("Starting unified scrape_and_parse...")
 
@@ -544,7 +604,14 @@ async def main():
             if idx > 0 and idx % 50 == 0:
                 await refresh_headers_and_cookies()
 
-            saved, total = await process_leaf_url(session, leaf_url, token, db_conn)
+            try:
+                saved, total = await process_leaf_url(session, leaf_url, token, db_conn)
+            except AntibotExit:
+                db_conn.commit()
+                set_checkpoint(db_conn, checkpoint_key, {"last_index": idx})
+                log.error(f"Anti-bot exit at leaf {idx + 1}/{len(leaf_urls)}. Progress saved.")
+                raise
+
             total_saved += saved
             db_conn.commit()
 
