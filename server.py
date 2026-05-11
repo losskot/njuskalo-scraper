@@ -19,7 +19,7 @@ from datetime import datetime
 
 from flask import Flask, request, jsonify, send_from_directory
 
-from db import DB_PATH
+from db import DB_PATH, init_db
 
 app = Flask(__name__, static_folder="static")
 
@@ -112,6 +112,8 @@ def api_listings():
         conditions.append("has_dishwasher = 1")
     if request.args.get("has_air_conditioning") == "1":
         conditions.append("has_air_conditioning = 1")
+    if request.args.get("starred") == "1":
+        conditions.append("starred = 1")
 
     # Heating type filter
     heating = request.args.get("heating_type")
@@ -151,7 +153,7 @@ def api_listings():
         f"SELECT id, title, price, price_eur, location, lat, lng, rooms, area_m2, "
         f"street, phone, has_bathtub, no_agency_fee, has_washing_machine, "
         f"has_dishwasher, has_air_conditioning, heating_type, url, available_from, "
-        f"agency_name, furnishing "
+        f"agency_name, furnishing, starred "
         f"FROM listings WHERE {where} ORDER BY price_eur ASC NULLS LAST "
         f"LIMIT ? OFFSET ?",
         params + [fetch_limit, offset],
@@ -188,6 +190,7 @@ def api_listings():
             "available_from": r["available_from"],
             "agency_name": r["agency_name"],
             "furnishing": r["furnishing"],
+            "starred": r["starred"],
         })
 
     conn.close()
@@ -237,6 +240,7 @@ def api_stats():
     stats["with_coords"] = conn.execute("SELECT COUNT(*) FROM listings WHERE lat IS NOT NULL").fetchone()[0]
     stats["with_phone"] = conn.execute("SELECT COUNT(*) FROM listings WHERE phone IS NOT NULL").fetchone()[0]
     stats["ai_enriched"] = conn.execute("SELECT COUNT(*) FROM listings WHERE ai_enriched_at IS NOT NULL").fetchone()[0]
+    stats["bathtub_analyzed"] = conn.execute("SELECT COUNT(*) FROM listings WHERE bathtub_analyzed_at IS NOT NULL").fetchone()[0]
     stats["has_bathtub"] = conn.execute("SELECT COUNT(*) FROM listings WHERE has_bathtub=1").fetchone()[0]
     stats["no_agency_fee"] = conn.execute("SELECT COUNT(*) FROM listings WHERE no_agency_fee=1").fetchone()[0]
     stats["has_washing_machine"] = conn.execute("SELECT COUNT(*) FROM listings WHERE has_washing_machine=1").fetchone()[0]
@@ -296,10 +300,53 @@ def api_filters():
     })
 
 
+# ─── API: Toggle star ────────────────────────────────────────────────────────
+
+@app.route("/api/listings/<listing_id>/star", methods=["POST"])
+def api_toggle_star(listing_id):
+    conn = get_conn()
+    row = conn.execute("SELECT starred FROM listings WHERE id=?", (listing_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    new_val = 0 if row["starred"] else 1
+    conn.execute("UPDATE listings SET starred=? WHERE id=?", (new_val, listing_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"starred": new_val})
+
+
+# ─── API: Update listing tags (bathtub, AC, dishwasher) ──────────────────────
+
+@app.route("/api/listings/<listing_id>/tags", methods=["PATCH"])
+def api_update_tags(listing_id):
+    conn = get_conn()
+    row = conn.execute("SELECT id FROM listings WHERE id=?", (listing_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+
+    data = request.get_json(force=True)
+    allowed = {"has_bathtub", "has_air_conditioning", "has_dishwasher"}
+    updates = {k: int(v) for k, v in data.items() if k in allowed and v in (0, 1, True, False)}
+
+    if updates:
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        conn.execute(
+            f"UPDATE listings SET {set_clause} WHERE id=?",
+            list(updates.values()) + [listing_id],
+        )
+        conn.commit()
+
+    conn.close()
+    return jsonify({"updated": updates})
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--host", default="127.0.0.1")
     args = parser.parse_args()
+    init_db()
     app.run(host=args.host, port=args.port, debug=True)

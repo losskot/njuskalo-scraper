@@ -26,6 +26,7 @@ import re
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from azure.identity import AzureCliCredential
@@ -47,6 +48,7 @@ API_VERSION = "2025-01-01-preview"
 DEFAULT_MODEL = "gpt-5.2-chat"
 MAX_RETRIES = 6
 MAX_IMAGES_PER_LISTING = 15
+MAX_LISTING_AGE_DAYS = 30  # skip listings published more than this many days ago (0 = no limit)
 AI_TEXT_WORKERS = 5
 AI_VISION_WORKERS = 3
 
@@ -466,10 +468,12 @@ def enrich_listing(client_holder, model, listing_row, skip_vision=False):
 
     if bathtub_from_tags is not None:
         updates["has_bathtub"] = 1 if bathtub_from_tags else 0
+        updates["bathtub_analyzed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     elif not skip_vision and image_urls:
         has_bathtub = ai_vision_bathtub(client_holder, model, image_urls)
         if has_bathtub is not None:
             updates["has_bathtub"] = 1 if has_bathtub else 0
+            updates["bathtub_analyzed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
 
     # Write updates
     if updates:
@@ -491,6 +495,8 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Max listings to process (0=all)")
     parser.add_argument("--skip-vision", action="store_true", help="Skip bathtub vision analysis")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Azure OpenAI model deployment name")
+    parser.add_argument("--max-age", type=int, default=MAX_LISTING_AGE_DAYS,
+                        help=f"Max listing age in days based on published_at (default: {MAX_LISTING_AGE_DAYS}, 0=no limit)")
     args = parser.parse_args()
 
     log.info("Starting AI enrichment...")
@@ -502,6 +508,26 @@ def main():
         query += f" LIMIT {args.limit}"
     rows = db_conn.execute(query).fetchall()
     db_conn.close()
+
+    # Age filter: drop listings published more than max_age days ago
+    if args.max_age > 0:
+        cutoff = datetime.now() - timedelta(days=args.max_age)
+        filtered_rows = []
+        for row in rows:
+            pub_raw = row["published_at"] or ""
+            pub_str = pub_raw.split(" u ")[0].strip().rstrip(".")
+            if pub_str:
+                try:
+                    pub_dt = datetime.strptime(pub_str, "%d.%m.%Y")
+                    if pub_dt < cutoff:
+                        continue
+                except ValueError:
+                    pass
+            filtered_rows.append(row)
+        skipped = len(rows) - len(filtered_rows)
+        if skipped:
+            log.info(f"  Age filter (>{args.max_age}d): skipped {skipped} old listings")
+        rows = filtered_rows
 
     if not rows:
         log.info("No listings need enrichment.")

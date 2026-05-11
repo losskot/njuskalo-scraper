@@ -62,6 +62,7 @@ IMAGE_DOWNLOAD_SEM  = 10
 AI_TEXT_WORKERS      = 5
 AI_VISION_WORKERS    = 3
 MAX_IMAGES_PER_LISTING = 15  # skip the rest
+MAX_LISTING_AGE_DAYS   = 30  # skip listings published more than this many days ago (0 = no limit)
 
 SCRIPT_DIR      = Path(__file__).parent
 JSON_DIR        = SCRIPT_DIR / "backend" / "json"
@@ -450,7 +451,7 @@ def check_availability_ai(client_holder: MultiClientHolder, model: str,
     return True
 
 
-def load_and_prefilter(json_dir: Path) -> tuple[list[dict], dict]:
+def load_and_prefilter(json_dir: Path, max_age_days: int = MAX_LISTING_AGE_DAYS) -> tuple[list[dict], dict]:
     """Load all JSONs and apply fast pre-filters. Returns (survivors, stats)."""
     files = sorted(glob.glob(str(json_dir / "*.json")))
     stats = {
@@ -458,10 +459,12 @@ def load_and_prefilter(json_dir: Path) -> tuple[list[dict], dict]:
         "loaded": 0,
         "price_ok": 0,
         "zagreb_ok": 0,
+        "age_ok": 0,
         "avail_ok": 0,
         "avail_needs_ai": 0,
     }
 
+    today = date.today()
     survivors = []
     for fpath in files:
         try:
@@ -484,6 +487,16 @@ def load_and_prefilter(json_dir: Path) -> tuple[list[dict], dict]:
         if not is_in_zagreb(data):
             continue
         stats["zagreb_ok"] += 1
+
+        # Age filter (oglas_objavljen)
+        published_raw = data.get("oglas_objavljen", "")
+        pub_date_str = published_raw.split(" u ")[0] if published_raw else ""
+        data["_published"] = pub_date_str
+        if max_age_days > 0 and pub_date_str:
+            pub_date = parse_date(pub_date_str)
+            if pub_date and (today - pub_date).days > max_age_days:
+                continue
+        stats["age_ok"] += 1
 
         # Availability filter
         avail = check_availability(data)
@@ -753,6 +766,7 @@ def generate_html(results: list[dict], stats: dict, out_path: Path):
             "rooms": r.get("rooms", ""),
             "area": r.get("area", ""),
             "id": r["id"],
+            "published": r.get("published", ""),
         }
         for r in results
     ], ensure_ascii=False)
@@ -772,19 +786,52 @@ def generate_html(results: list[dict], stats: dict, out_path: Path):
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
   #header {{
-    background: #1a1a2e; color: #fff; padding: 16px 24px;
-    display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+    background: #1a1a2e; color: #fff; padding: 12px 20px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap; z-index: 1000;
   }}
-  #header h1 {{ font-size: 1.3rem; }}
-  .stat {{ background: rgba(255,255,255,0.1); padding: 6px 14px; border-radius: 6px; font-size: 0.85rem; }}
+  #header h1 {{ font-size: 1.2rem; margin-right: 4px; }}
+  .stat {{ background: rgba(255,255,255,0.1); padding: 5px 12px; border-radius: 6px; font-size: 0.82rem; }}
   .stat b {{ color: #4fc3f7; }}
-  #map {{ height: calc(100vh - 70px); width: 100%; }}
+  #map {{ height: calc(100vh - 54px); width: 100%; }}
+
+  /* ── Floating filter panel ── */
+  #filter-panel {{
+    position: absolute;
+    top: 70px; right: 12px;
+    z-index: 1000;
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+    padding: 14px 16px;
+    min-width: 220px;
+    font-size: 0.88rem;
+    color: #222;
+  }}
+  #filter-panel h3 {{
+    font-size: 0.9rem; font-weight: 700; margin-bottom: 12px;
+    color: #1565c0; border-bottom: 1px solid #e3eaf3; padding-bottom: 6px;
+  }}
+  .fp-row {{ margin-bottom: 10px; }}
+  .fp-row label {{ display: block; font-weight: 600; margin-bottom: 4px; color: #444; }}
+  .fp-row select, .fp-row input[type=range] {{ width: 100%; }}
+  .fp-row select {{
+    border: 1px solid #cdd5e0; border-radius: 5px; padding: 5px 8px;
+    font-size: 0.85rem; background: #f7f9fc; cursor: pointer; color: #222;
+  }}
+  .fp-row input[type=range] {{ accent-color: #1565c0; cursor: pointer; }}
+  .fp-row .range-val {{ text-align: right; color: #1565c0; font-weight: 700; font-size: 0.82rem; }}
+  #fp-count {{
+    margin-top: 10px; padding-top: 8px; border-top: 1px solid #e3eaf3;
+    text-align: center; font-size: 0.85rem; color: #555;
+  }}
+  #fp-count b {{ color: #1565c0; font-size: 1rem; }}
+
   .price-icon {{
     background: #1565c0; color: #fff; font-weight: 700; font-size: 12px;
     padding: 3px 7px; border-radius: 4px; white-space: nowrap;
     box-shadow: 0 1px 4px rgba(0,0,0,0.3); border: 1px solid #0d47a1;
   }}
-  .leaflet-popup-content {{ min-width: 220px; }}
+  .leaflet-popup-content {{ min-width: 230px; }}
   .popup-title {{ font-weight: 600; font-size: 0.95rem; margin-bottom: 6px; }}
   .popup-row {{ font-size: 0.85rem; color: #444; margin: 3px 0; }}
   .popup-price {{ font-size: 1.1rem; font-weight: 700; color: #1565c0; }}
@@ -794,15 +841,41 @@ def generate_html(results: list[dict], stats: dict, out_path: Path):
 <body>
 <div id="header">
   <h1>🏠 Zagreb Apartments</h1>
-  <span class="stat">Scraped: <b id="s-total">-</b></span>
+  <span class="stat">Total scraped: <b id="s-total">-</b></span>
   <span class="stat">Price &lt;{MAX_PRICE_EUR}€: <b id="s-price">-</b></span>
   <span class="stat">Available: <b id="s-avail">-</b></span>
   <span class="stat">No fee: <b id="s-fee">-</b></span>
   <span class="stat">Bathtub: <b id="s-bathtub">-</b></span>
 </div>
+
 <div id="map"></div>
+
+<!-- Floating filter panel -->
+<div id="filter-panel">
+  <h3>🔍 Map Filters</h3>
+
+  <div class="fp-row">
+    <label for="age-filter">📅 Published within</label>
+    <select id="age-filter">
+      <option value="0">All time</option>
+      <option value="7">Last 7 days</option>
+      <option value="14">Last 14 days</option>
+      <option value="30" selected>Last 30 days</option>
+      <option value="60">Last 60 days</option>
+      <option value="90">Last 90 days</option>
+    </select>
+  </div>
+
+  <div class="fp-row">
+    <label for="price-filter">💶 Max price: <span class="range-val" id="price-val">any</span></label>
+    <input type="range" id="price-filter" min="100" max="{MAX_PRICE_EUR}" step="10" value="{MAX_PRICE_EUR}">
+  </div>
+
+  <div id="fp-count">Showing <b id="s-showing">-</b> listings</div>
+</div>
+
 <script>
-const markers = {markers_json};
+const markersData = {markers_json};
 const stats = {stats_json};
 
 document.getElementById('s-total').textContent   = stats.total || '-';
@@ -817,28 +890,70 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
   maxZoom: 19,
 }}).addTo(map);
 
-markers.forEach(m => {{
+function parseCroDate(s) {{
+  if (!s) return null;
+  const p = s.split('.');
+  if (p.length < 3) return null;
+  return new Date(parseInt(p[2]), parseInt(p[1]) - 1, parseInt(p[0]));
+}}
+
+markersData.forEach(m => {{ m._date = parseCroDate(m.published); }});
+
+const leafletMarkers = markersData.map(m => {{
   const icon = L.divIcon({{
     className: '',
     html: '<div class="price-icon">' + m.price + '€</div>',
-    iconSize: [60, 22],
-    iconAnchor: [30, 11],
+    iconSize: [60, 22], iconAnchor: [30, 11],
   }});
-  const marker = L.marker([m.lat, m.lng], {{ icon }}).addTo(map);
-  marker.bindPopup(
+  const lm = L.marker([m.lat, m.lng], {{ icon }});
+  lm.bindPopup(
     '<div class="popup-title">' + m.title.substring(0, 80) + '</div>' +
-    '<div class="popup-price">' + m.price + ' €/month</div>' +
+    '<div class="popup-price">' + m.price + ' \u20ac/month</div>' +
     '<div class="popup-row">📍 ' + (m.address || 'N/A') + '</div>' +
-    (m.rooms ? '<div class="popup-row">🛏️ ' + m.rooms + '</div>' : '') +
-    (m.area ? '<div class="popup-row">📐 ' + m.area + '</div>' : '') +
-    '<a class="popup-link" href="' + m.url + '" target="_blank">↗ Open on Njuškalo</a>'
+    (m.rooms ? '<div class="popup-row">🛏 ' + m.rooms + '</div>' : '') +
+    (m.area  ? '<div class="popup-row">📐 ' + m.area  + '</div>' : '') +
+    (m.published ? '<div class="popup-row">📅 ' + m.published + '</div>' : '') +
+    '<a class="popup-link" href="' + m.url + '" target="_blank">↗ Open on Nju\u0161kalo</a>'
   );
+  return lm;
 }});
 
-if (markers.length > 0) {{
-  const group = L.featureGroup(
-    markers.map(m => L.marker([m.lat, m.lng]))
-  );
+const ageSelect   = document.getElementById('age-filter');
+const priceSlider = document.getElementById('price-filter');
+const priceVal    = document.getElementById('price-val');
+const maxPriceCap = {MAX_PRICE_EUR};
+
+priceVal.textContent = maxPriceCap + '\u20ac';
+
+function applyFilters() {{
+  const maxDays  = parseInt(ageSelect.value);
+  const maxPrice = parseInt(priceSlider.value);
+priceVal.textContent = maxPrice >= maxPriceCap ? 'any' : maxPrice + '€';
+
+  const now = new Date(); now.setHours(0,0,0,0);
+  let visible = 0;
+  markersData.forEach((m, i) => {{
+    const lm = leafletMarkers[i];
+    let show = true;
+    if (maxDays > 0 && m._date) {{
+      show = Math.floor((now - m._date) / 86400000) <= maxDays;
+    }}
+    if (show && maxPrice < maxPriceCap) {{
+      show = m.price <= maxPrice;
+    }}
+    if (show) {{ if (!map.hasLayer(lm)) lm.addTo(map); visible++; }}
+    else       {{ if (map.hasLayer(lm)) map.removeLayer(lm); }}
+  }});
+  document.getElementById('s-showing').textContent = visible;
+}}
+
+ageSelect.addEventListener('change', applyFilters);
+priceSlider.addEventListener('input', applyFilters);
+
+applyFilters();
+
+if (markersData.length > 0) {{
+  const group = L.featureGroup(markersData.map(m => L.marker([m.lat, m.lng])));
   map.fitBounds(group.getBounds().pad(0.1));
 }}
 </script>
@@ -923,12 +1038,13 @@ async def run_pipeline(args):
         log.info("Phase 1: Loading & pre-filtering JSONs")
         log.info("═" * 60)
 
-        survivors, stats = load_and_prefilter(Path(args.json_dir))
+        survivors, stats = load_and_prefilter(Path(args.json_dir), max_age_days=args.max_age)
 
         log.info(f"  Total JSON files : {stats['total']}")
         log.info(f"  Loaded           : {stats['loaded']}")
         log.info(f"  Price < {MAX_PRICE_EUR}€      : {stats['price_ok']}")
         log.info(f"  In Zagreb        : {stats['zagreb_ok']}")
+        log.info(f"  Age <= {args.max_age}d       : {stats['age_ok']}")
         log.info(f"  Available by {AVAILABLE_BY} : {stats['avail_ok']} ({stats['avail_needs_ai']} need AI check)")
         log.info(f"  → Survivors      : {len(survivors)}")
 
@@ -979,6 +1095,7 @@ async def run_pipeline(args):
                 "address": d.get("Lokacija", ""),
                 "rooms": d.get("Broj soba", ""),
                 "area": d.get("Stambena površina", ""),
+                "published": d.get("_published", ""),
             })
         stats["no_fee_ok"] = "N/A"
         stats["bathtub_ok"] = "N/A"
@@ -1184,6 +1301,7 @@ async def run_pipeline(args):
                 "address": d.get("_address", d.get("Lokacija", "")),
                 "rooms": d.get("Broj soba", ""),
                 "area": d.get("Stambena površina", ""),
+                "published": d.get("_published", ""),
             })
             log.info(f"  [{lid}] ✓ PASS — bathtub confirmed ({done_so_far}/{total_to_check})")
         else:
@@ -1222,6 +1340,7 @@ async def run_pipeline(args):
     log.info(f"DONE in {elapsed:.1f}s")
     log.info(f"  Scraped    : {stats['total']}")
     log.info(f"  Price OK   : {stats['price_ok']}")
+    log.info(f"  Age ok     : {stats['age_ok']}")
     log.info(f"  Available  : {stats['avail_ok']}")
     log.info(f"  No fee     : {stats['no_fee_ok']}")
     log.info(f"  Bathtub    : {stats['bathtub_ok']}")
@@ -1242,6 +1361,8 @@ def main():
                         help=f"Azure OpenAI model (default: {DEFAULT_MODEL})")
     parser.add_argument("--max-images", type=int, default=MAX_IMAGES_PER_LISTING,
                         help="Max images to check per listing for bathtub")
+    parser.add_argument("--max-age", type=int, default=MAX_LISTING_AGE_DAYS,
+                        help=f"Max listing age in days (default: {MAX_LISTING_AGE_DAYS}, 0=no limit)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Skip AI, output all pre-filtered listings on map")
     parser.add_argument("--resume", action="store_true",
