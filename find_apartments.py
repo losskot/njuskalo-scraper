@@ -44,10 +44,10 @@ from curl_cffi.requests import AsyncSession
 
 AZURE_ENDPOINTS = [
     "https://admin-ml8gx7ra-eastus2.cognitiveservices.azure.com/",
-    "https://eastus.api.cognitive.microsoft.com/",
-    "https://westus.api.cognitive.microsoft.com/",
-    "https://swedencentral.api.cognitive.microsoft.com/",
-    "https://francecentral.api.cognitive.microsoft.com/",
+    "https://gpt52-eastus.cognitiveservices.azure.com/",
+    "https://gpt52-westus.cognitiveservices.azure.com/",
+    "https://gpt52-swedencentral.cognitiveservices.azure.com/",
+    "https://gpt52-francecentral.cognitiveservices.azure.com/",
 ]
 API_VERSION    = "2025-01-01-preview"
 DEFAULT_MODEL  = "gpt-5.2-chat"

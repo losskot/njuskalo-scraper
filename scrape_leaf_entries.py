@@ -1,3 +1,7 @@
+class AntibotExit(Exception):
+    """Raised when anti-bot detection triggers a clean exit."""
+    pass
+
 def phone_already_in_db(ad_id, conn):
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM phones WHERE ad_id=? LIMIT 1", (ad_id,))
@@ -358,12 +362,12 @@ async def fetch_html(session, url):
         if re.search(r'<title>\s*ShieldSquare Captcha\s*</title>', text, re.IGNORECASE):
             ad_id = extract_ad_id(url)
             print(f"[BLOCK DETECTED] {ad_id} - Exiting script and pausing for 1 minute...")
-            import sys
-            import time
-            time.sleep(60)
-            sys.exit(99)
+            await asyncio.sleep(60)
+            raise AntibotExit()
         return text
         
+    except AntibotExit:
+        raise
     except Exception as e:
         ad_id = extract_ad_id(url)
         log_http_failure(url, str(e), 0)
@@ -391,10 +395,8 @@ async def fetch_html(session, url):
                     import re
                     if re.search(r'<title>\s*ShieldSquare Captcha\s*</title>', text, re.IGNORECASE):
                         print(f"[BLOCK DETECTED] {ad_id} - Exiting script and pausing for 1 minute...")
-                        import sys
-                        import time
-                        time.sleep(60)
-                        sys.exit(99)
+                        await asyncio.sleep(60)
+                        raise AntibotExit()
                     return text
             except Exception as e2:
                 log_http_failure(url, str(e2), 0, "proxy_retry_failed")
@@ -682,8 +684,11 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
         sys.exit(0)
-    except SystemExit as e:
-        sys.exit(e.code)
+    except (SystemExit, KeyboardInterrupt) as e:
+        code = getattr(e, 'code', 1)
+        sys.exit(code if code else 0)
+    except AntibotExit:
+        sys.exit(99)
     except Exception as e:
         print(f"[ERROR] Unhandled exception: {e}")
         sys.exit(1)

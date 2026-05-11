@@ -432,6 +432,8 @@ def extract_category_links_from_html(html):
             if a and a.get("href"):
                 name = a.get_text(strip=True)
                 href = a.get("href")
+                if href.startswith("/"):
+                    href = "https://www.njuskalo.hr" + href
                 links.append({"name": name, "url": href})
         
         # Log successful parsing
@@ -668,7 +670,7 @@ async def build_category_tree(session, url, name, depth=0, max_depth=10, logger=
     if is_block_page(html):
         safe_print(f"[BLOCK DETECTED] {name} ({url}) - Exiting script and pausing for 1 minute...")
         await asyncio.sleep(60)
-        sys.exit(99)  # Custom exit code for blockage
+        raise AntibotExit()
 
     # Save HTML for every node, even if it's None or error response
     try:
@@ -856,14 +858,21 @@ async def main_category_tree_scrape():
     if 'logger' in locals():
         logger.print_log()
 
+class AntibotExit(Exception):
+    """Raised when anti-bot detection triggers a clean exit."""
+    pass
+
 if __name__ == "__main__":
     import aiofiles
     safe_print(f"[INFO] Using concurrency: {get_concurrency()}")
     try:
         asyncio.run(main_category_tree_scrape())
-        sys.exit(0)  # Normal completion
-    except SystemExit as e:
-        sys.exit(e.code)
+        sys.exit(0)
+    except AntibotExit:
+        sys.exit(99)
+    except (SystemExit, KeyboardInterrupt) as e:
+        code = getattr(e, 'code', 1)
+        sys.exit(code if code else 0)
     except Exception as e:
         safe_print(f"[ERROR] Unhandled exception: {e}")
         sys.exit(1)
