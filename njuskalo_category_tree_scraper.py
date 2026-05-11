@@ -854,6 +854,19 @@ async def main_category_tree_scrape():
     log_process_end("category_tree_scraping", start_time)
     
     safe_print("\nCategory Tree Structure:\n")
+    # Print tree summary with counts
+    for cat_name, tree_data in all_trees.items():
+        def count_leaves(nodes):
+            n = 0
+            if isinstance(nodes, list):
+                for node in nodes:
+                    if not node.get("children"):
+                        n += 1
+                    else:
+                        n += count_leaves(node["children"])
+            return n
+        n_leaves = count_leaves(tree_data) if isinstance(tree_data, list) else 0
+        safe_print(f"  {cat_name}: {n_leaves} leaf categories")
     # Optionally print the last logger's log (for the last category)
     if 'logger' in locals():
         logger.print_log()

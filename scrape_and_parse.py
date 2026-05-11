@@ -434,6 +434,10 @@ async def process_entry(session, entry_url, bearer_token, db_conn):
     # 5. Store raw HTML for history
     store_html(ad_id, html)
 
+    title = parsed.get("naslov", "")[:60]
+    price = parsed.get("cijena", "?")
+    log.info(f"  ✓ {ad_id} | {price} | {title}")
+
     return True
 
 

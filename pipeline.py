@@ -45,34 +45,39 @@ class PipelineRunner:
         self.step_times = {}
 
     def run_script(self, script_name, step_num, description):
-        """Run a Python script and track execution time."""
+        """Run a Python script with live output streaming."""
         logging.info("=" * 60)
         logging.info(f"STEP {step_num}: {description}")
         logging.info(f"Running: {script_name}")
         logging.info("=" * 60)
 
         step_start = time.time()
+        last_stderr = ""
 
         try:
-            result = subprocess.run(
-                [sys.executable, script_name],
-                capture_output=True, text=True, encoding='utf-8'
+            proc = subprocess.Popen(
+                [sys.executable, "-u", script_name],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='replace',
             )
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if line:
+                    logging.info(f"  [{step_num}] {line}")
+                    last_stderr = line
+            proc.wait()
+
             step_duration = time.time() - step_start
             self.step_times[f"Step {step_num}"] = step_duration
 
-            if result.returncode == 0:
+            if proc.returncode == 0:
                 logging.info(f"✅ STEP {step_num} COMPLETED in {step_duration:.2f}s")
-                if result.stdout:
-                    logging.info(f"Output:\n{result.stdout[-2000:]}")
                 return True
-            elif result.returncode == 99:
+            elif proc.returncode == 99:
                 logging.warning(f"⚠️ STEP {step_num} ANTI-BOT DETECTED in {step_duration:.2f}s")
                 return False
             else:
                 logging.error(f"❌ STEP {step_num} FAILED in {step_duration:.2f}s")
-                if result.stderr:
-                    logging.error(f"Error:\n{result.stderr[-2000:]}")
                 return False
 
         except Exception as e:
