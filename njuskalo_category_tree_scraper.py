@@ -312,23 +312,7 @@ COOKIES = {
 
 # --- Category list to scrape ---
 CATEGORIES = [
-    "prodaja-kuca",
-    "iznajmljivanje-kuca",
-    "prodaja-stanova",
-    "iznajmljivanje-stanova",
-    "prodaja-zemljista",
-    "zakup-zemljista",
-    "prodaja-poslovnih-prostora",
-    "iznajmljivanje-poslovnih-prostora",
-    "novogradnja",
-    "vikendice",
-    "montazni-objekti",
-    "prodaja-luksuznih-nekretnina",
-    "iznajmljivanje-luksuznih-nekretnina",
-    "prodaja-garaza",
-    "iznajmljivanje-garaza",
-    "iznajmljivanje-soba",
-    "cimeri"
+    "iznajmljivanje-stanova/zagreb",
 ]
 
 
@@ -820,9 +804,10 @@ async def main_category_tree_scrape():
             safe_print(f"[CHECKPOINT] Skipping already completed category: {cat}")
             continue
         url = f"https://www.njuskalo.hr/{cat}"
-        html_file = os.path.join(CATEGORIES_HTMLS_DIR, f"{cat}_{today_str}.html")
-        tree_file = os.path.join(CATEGORIES_TREE_DIR, f"{cat}_tree_{today_str}.json")
-        log_file = os.path.join(CATEGORIES_LOGS_DIR, f"{cat}_{today_str}.log")
+        cat_safe = cat.replace("/", "_")  # sanitize for file system paths
+        html_file = os.path.join(CATEGORIES_HTMLS_DIR, f"{cat_safe}_{today_str}.html")
+        tree_file = os.path.join(CATEGORIES_TREE_DIR, f"{cat_safe}_tree_{today_str}.json")
+        log_file = os.path.join(CATEGORIES_LOGS_DIR, f"{cat_safe}_{today_str}.log")
         logger = CategoryLogger(log_file_path=log_file)
         if not os.path.exists(html_file):
             safe_print(f"Fetching first page for {cat} and saving as {html_file}...")
