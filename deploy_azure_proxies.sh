@@ -77,14 +77,26 @@ for REGION in "${REGIONS[@]}"; do
 
     # 3. Deploy code
     echo "  Deploying function code..."
+    TMPZIP="/tmp/njusk-proxy-deploy-${REGION}.zip"
+    rm -f "$TMPZIP"
+    (cd "$FUNC_DIR" && zip -r "$TMPZIP" . -x '*.pyc' '__pycache__/*' > /dev/null)
+
+    # Try func CLI first, fall back to az zip deploy
+    set +e
     pushd "$FUNC_DIR" > /dev/null
-    func azure functionapp publish "$APP_NAME" --python --no-build 2>/dev/null || \
+    func azure functionapp publish "$APP_NAME" --python --no-build > /dev/null 2>&1
+    DEPLOY_RC=$?
+    popd > /dev/null
+    if [[ $DEPLOY_RC -ne 0 ]]; then
+        echo "  func publish failed (rc=$DEPLOY_RC), using az zip deploy..."
         az functionapp deployment source config-zip \
             --resource-group "$RESOURCE_GROUP" \
             --name "$APP_NAME" \
-            --src <(cd "$FUNC_DIR" && zip -r - . -x '*.pyc' '__pycache__/*') \
-            --output none
-    popd > /dev/null
+            --src "$TMPZIP" \
+            --output none 2>&1 || echo "  [WARN] zip deploy also failed, function may need manual deploy"
+    fi
+    set -e
+    rm -f "$TMPZIP"
 
     # 4. Get the function key
     echo "  Retrieving function key..."

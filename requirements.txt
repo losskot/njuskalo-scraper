@@ -1,11 +1,15 @@
 aiofiles
+aiohttp
 asyncio
 beautifulsoup4
 colorama
 curl_cffi
+flask
 requests
 lxml
 python-dateutil
 tqdm
 playwright 
 playwright-stealth
+azure-identity
+openai

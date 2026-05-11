@@ -3,19 +3,18 @@
 Njuskalo Scraping Pipeline
 =========================
 
-This pipeline runs the complete Njuskalo scraping process in the correct order:
+3-step pipeline — everything goes into listings.db (no intermediate files):
 
-1. njuskalo_category_tree_scraper.py - Scrape category tree and URLs
-2. scrape_leaf_entries.py - Scrape individual ad HTML pages
-3. fetch_phones_from_api.py - Fetch phone numbers via API
-4. parser_ultrafast.py - Parse HTML to structured JSON
+1. njuskalo_category_tree_scraper.py — Scrape category tree → DB (categories, leaf_urls)
+2. scrape_and_parse.py — Download HTML → parse → fetch phone → insert into DB
+3. ai_enrich.py — AI enrichment (agency fee, appliances, bathtub vision)
 
 Usage:
     python pipeline.py [--step STEP] [--skip-existing]
 
 Options:
-    --step STEP         Run specific step only (1-4)
-    --skip-existing     Skip steps if output already exists
+    --step STEP         Run specific step only (1-3)
+    --skip-existing     Skip steps if output already exists in DB
 """
 
 import os
@@ -25,6 +24,8 @@ import subprocess
 import argparse
 from datetime import datetime
 import logging
+
+from db import get_db, log_event
 
 # Setup logging
 logging.basicConfig(
@@ -36,233 +37,196 @@ logging.basicConfig(
     ]
 )
 
+
 class PipelineRunner:
     def __init__(self, skip_existing=False):
         self.skip_existing = skip_existing
         self.start_time = time.time()
         self.step_times = {}
-        
+
     def run_script(self, script_name, step_num, description):
-        """Run a Python script and track execution time"""
-        logging.info(f"=" * 60)
+        """Run a Python script and track execution time."""
+        logging.info("=" * 60)
         logging.info(f"STEP {step_num}: {description}")
         logging.info(f"Running: {script_name}")
-        logging.info(f"=" * 60)
-        
+        logging.info("=" * 60)
+
         step_start = time.time()
-        
+
         try:
-            # Run the script
-            result = subprocess.run([
-                sys.executable, script_name
-            ], capture_output=True, text=True, encoding='utf-8')
-            
+            result = subprocess.run(
+                [sys.executable, script_name],
+                capture_output=True, text=True, encoding='utf-8'
+            )
             step_duration = time.time() - step_start
             self.step_times[f"Step {step_num}"] = step_duration
-            
+
             if result.returncode == 0:
                 logging.info(f"✅ STEP {step_num} COMPLETED in {step_duration:.2f}s")
-                logging.info(f"Output:\n{result.stdout}")
+                if result.stdout:
+                    logging.info(f"Output:\n{result.stdout[-2000:]}")
                 return True
+            elif result.returncode == 99:
+                logging.warning(f"⚠️ STEP {step_num} ANTI-BOT DETECTED in {step_duration:.2f}s")
+                return False
             else:
                 logging.error(f"❌ STEP {step_num} FAILED in {step_duration:.2f}s")
-                logging.error(f"Error output:\n{result.stderr}")
-                logging.error(f"Standard output:\n{result.stdout}")
+                if result.stderr:
+                    logging.error(f"Error:\n{result.stderr[-2000:]}")
                 return False
-                
+
         except Exception as e:
             step_duration = time.time() - step_start
             self.step_times[f"Step {step_num}"] = step_duration
             logging.error(f"❌ STEP {step_num} CRASHED in {step_duration:.2f}s: {e}")
             return False
-    
-    def check_output_exists(self, paths):
-        """Check if output files/directories exist"""
-        for path in paths:
-            if os.path.exists(path):
-                if os.path.isdir(path):
-                    files = os.listdir(path)
-                    if len(files) > 0:
-                        return True
-                else:
-                    return True
-        return False
-    
+
+    def _db_has_rows(self, table, min_count=1):
+        """Check if a DB table has at least min_count rows."""
+        try:
+            conn = get_db()
+            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            conn.close()
+            return count >= min_count
+        except Exception:
+            return False
+
     def step1_category_scraper(self):
-        """Step 1: Scrape category tree and URLs"""
-        if self.skip_existing:
-            # Check if category URLs already exist
-            if self.check_output_exists(['category_urls.json', 'categories.json']):
-                logging.info("⏭️  STEP 1 SKIPPED: Category data already exists")
-                return True
-        
+        """Step 1: Scrape category tree and extract leaf URLs into DB."""
+        if self.skip_existing and self._db_has_rows("leaf_urls"):
+            logging.info("⏭️  STEP 1 SKIPPED: leaf_urls table already populated")
+            return True
         return self.run_script(
-            'njuskalo_category_tree_scraper.py',
-            1,
-            'Scraping category tree and collecting URLs'
+            'njuskalo_category_tree_scraper.py', 1,
+            'Scraping category tree → DB (categories + leaf_urls)'
         )
-    
-    def step2_scrape_entries(self):
-        """Step 2: Scrape individual ad HTML pages"""
-        if self.skip_existing:
-            # Check if HTML files already exist
-            if self.check_output_exists(['backend/website']):
-                logging.info("⏭️  STEP 2 SKIPPED: HTML files already exist")
-                return True
-        
+
+    def step2_scrape_and_parse(self):
+        """Step 2: Download + parse + phone → DB (unified scraper)."""
+        if self.skip_existing and self._db_has_rows("listings", 10):
+            logging.info("⏭️  STEP 2 SKIPPED: listings table already has data")
+            return True
         return self.run_script(
-            'scrape_leaf_entries.py',
-            2,
-            'Scraping individual ad HTML pages'
+            'scrape_and_parse.py', 2,
+            'Download HTML → parse → fetch phone → insert into DB'
         )
-    
-    def step3_fetch_phones(self):
-        """Step 3: Fetch phone numbers via API"""
+
+    def step3_ai_enrich(self):
+        """Step 3: AI enrichment (agency fee, appliances, bathtub)."""
         if self.skip_existing:
-            # Check if phone database already exists
-            if self.check_output_exists(['backend/phoneDB/phones.db']):
-                logging.info("⏭️  STEP 3 SKIPPED: Phone database already exists")
+            conn = get_db()
+            unenriched = conn.execute(
+                "SELECT COUNT(*) FROM listings WHERE ai_enriched_at IS NULL"
+            ).fetchone()[0]
+            conn.close()
+            if unenriched == 0:
+                logging.info("⏭️  STEP 3 SKIPPED: all listings AI-enriched")
                 return True
-        
         return self.run_script(
-            'fetch_phones_from_api.py',
-            3,
-            'Fetching phone numbers via API'
+            'ai_enrich.py', 3,
+            'AI enrichment (agency fee, appliances, bathtub vision)'
         )
-    
-    def step4_parse_ultrafast(self):
-        """Step 4: Parse HTML to structured JSON"""
-        if self.skip_existing:
-            # Check if JSON files already exist
-            if self.check_output_exists(['backend/json']):
-                logging.info("⏭️  STEP 4 SKIPPED: JSON files already exist")
-                return True
-        
-        return self.run_script(
-            'parser_ultrafast.py',
-            4,
-            'Parsing HTML to structured JSON (ultrafast)'
-        )
-    
+
     def run_full_pipeline(self):
-        """Run the complete pipeline"""
-        logging.info("🚀 STARTING NJUSKALO SCRAPING PIPELINE")
+        """Run the complete 3-step pipeline."""
+        logging.info("🚀 STARTING NJUSKALO PIPELINE (DB-only)")
         logging.info(f"Started at: {datetime.now().isoformat()}")
-        
+
         steps = [
-            (self.step1_category_scraper, "Category Tree Scraper"),
-            (self.step2_scrape_entries, "HTML Page Scraper"),
-            (self.step3_fetch_phones, "Phone Number Fetcher"),
-            (self.step4_parse_ultrafast, "Ultrafast Parser")
+            (self.step1_category_scraper, "Category Scraper"),
+            (self.step2_scrape_and_parse, "Scrape + Parse + Phone"),
+            (self.step3_ai_enrich, "AI Enrichment"),
         ]
-        
+
         failed_steps = []
-        
         for i, (step_func, step_name) in enumerate(steps, 1):
             success = step_func()
             if not success:
                 failed_steps.append(f"Step {i}: {step_name}")
                 logging.error(f"Pipeline stopped at Step {i} due to failure")
                 break
-        
-        # Final summary
+
         total_time = time.time() - self.start_time
         logging.info("=" * 60)
         logging.info("🏁 PIPELINE SUMMARY")
         logging.info("=" * 60)
-        
+
         if failed_steps:
             logging.error(f"❌ Pipeline FAILED at: {', '.join(failed_steps)}")
         else:
             logging.info("✅ Pipeline COMPLETED SUCCESSFULLY!")
-        
+
         logging.info(f"Total execution time: {total_time:.2f}s")
-        
-        # Step-by-step timing - fixed logic
         for step, duration in self.step_times.items():
-            # Extract step number from step name (e.g., "Step 1" -> 1)
-            step_num = int(step.split()[1])
-            
-            # Check if this step failed by looking if there are any failed steps 
-            # and if this step number is at or after the first failed step
+            step_num = int(step.split()[1].rstrip(':'))
             if failed_steps:
-                first_failed_step = int(failed_steps[0].split()[1])
-                status = "❌" if step_num >= first_failed_step else "✅"
+                first_failed = int(failed_steps[0].split()[1].rstrip(':'))
+                status = "❌" if step_num >= first_failed else "✅"
             else:
                 status = "✅"
-                
             logging.info(f"{status} {step}: {duration:.2f}s")
-        
+
+        # Log to DB
+        try:
+            conn = get_db()
+            log_event(conn, "INFO", "pipeline",
+                      f"Pipeline {'completed' if not failed_steps else 'failed'} in {total_time:.0f}s")
+            conn.close()
+        except Exception:
+            pass
+
         return len(failed_steps) == 0
-    
+
     def run_single_step(self, step_num):
-        """Run a single step of the pipeline"""
+        """Run a single step."""
         steps = {
-            1: (self.step1_category_scraper, "Category Tree Scraper"),
-            2: (self.step2_scrape_entries, "HTML Page Scraper"), 
-            3: (self.step3_fetch_phones, "Phone Number Fetcher"),
-            4: (self.step4_parse_ultrafast, "Ultrafast Parser")
+            1: (self.step1_category_scraper, "Category Scraper"),
+            2: (self.step2_scrape_and_parse, "Scrape + Parse + Phone"),
+            3: (self.step3_ai_enrich, "AI Enrichment"),
         }
-        
         if step_num not in steps:
-            logging.error(f"Invalid step number: {step_num}. Must be 1-4.")
+            logging.error(f"Invalid step: {step_num}. Must be 1-3.")
             return False
-        
+
         step_func, step_name = steps[step_num]
         logging.info(f"🎯 RUNNING SINGLE STEP {step_num}: {step_name}")
-        
         success = step_func()
         total_time = time.time() - self.start_time
-        
+
         if success:
-            logging.info(f"✅ Step {step_num} completed successfully in {total_time:.2f}s")
+            logging.info(f"✅ Step {step_num} completed in {total_time:.2f}s")
         else:
             logging.error(f"❌ Step {step_num} failed after {total_time:.2f}s")
-        
         return success
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Njuskalo Scraping Pipeline',
+        description='Njuskalo Scraping Pipeline (DB-only)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
-    
-    parser.add_argument(
-        '--step', 
-        type=int, 
-        choices=[1, 2, 3, 4],
-        help='Run specific step only (1-4)'
-    )
-    
-    parser.add_argument(
-        '--skip-existing',
-        action='store_true',
-        help='Skip steps if output already exists'
-    )
-    
+    parser.add_argument('--step', type=int, choices=[1, 2, 3],
+                        help='Run specific step only (1-3)')
+    parser.add_argument('--skip-existing', action='store_true',
+                        help='Skip steps if output already exists in DB')
     args = parser.parse_args()
-    
-    # Create pipeline runner
+
     runner = PipelineRunner(skip_existing=args.skip_existing)
-    
+
     try:
         if args.step:
-            # Run single step
             success = runner.run_single_step(args.step)
         else:
-            # Run full pipeline
             success = runner.run_full_pipeline()
-        
-        # Exit with appropriate code
         sys.exit(0 if success else 1)
-        
     except KeyboardInterrupt:
-        logging.warning("🛑 Pipeline interrupted by user")
+        logging.warning("🛑 Pipeline interrupted")
         sys.exit(130)
     except Exception as e:
         logging.error(f"💥 Pipeline crashed: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

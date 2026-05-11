@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""
+server.py — Flask API + static viewer for listings database.
+
+Endpoints:
+    GET /                           — static HTML viewer
+    GET /api/listings               — filtered listings (paginated)
+    GET /api/listings/<id>          — single listing with images + tags
+    GET /api/stats                  — aggregate stats
+    GET /api/filters                — distinct filter values
+
+Usage:
+    python server.py [--port 5000] [--host 0.0.0.0]
+"""
+import json
+import os
+import sqlite3
+
+from flask import Flask, request, jsonify, send_from_directory
+
+from db import DB_PATH
+
+app = Flask(__name__, static_folder="static")
+
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+# ─── Static viewer ────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return send_from_directory("static", "index.html")
+
+
+# ─── API: Filtered listings ───────────────────────────────────────────────────
+
+@app.route("/api/listings")
+def api_listings():
+    conn = get_conn()
+    conditions = []
+    params = []
+
+    # Price filter
+    price_min = request.args.get("price_min", type=float)
+    price_max = request.args.get("price_max", type=float)
+    if price_min is not None:
+        conditions.append("price_eur >= ?")
+        params.append(price_min)
+    if price_max is not None:
+        conditions.append("price_eur <= ?")
+        params.append(price_max)
+
+    # Rooms filter (comma-separated)
+    rooms = request.args.get("rooms")
+    if rooms:
+        room_list = [r.strip() for r in rooms.split(",") if r.strip()]
+        if room_list:
+            placeholders = ",".join("?" * len(room_list))
+            conditions.append(f"rooms IN ({placeholders})")
+            params.extend(room_list)
+
+    # Area filter
+    area_min = request.args.get("area_min", type=float)
+    area_max = request.args.get("area_max", type=float)
+    if area_min is not None:
+        conditions.append("area_m2 >= ?")
+        params.append(area_min)
+    if area_max is not None:
+        conditions.append("area_m2 <= ?")
+        params.append(area_max)
+
+    # Map bounds filter
+    lat_min = request.args.get("lat_min", type=float)
+    lat_max = request.args.get("lat_max", type=float)
+    lng_min = request.args.get("lng_min", type=float)
+    lng_max = request.args.get("lng_max", type=float)
+    if all(v is not None for v in [lat_min, lat_max, lng_min, lng_max]):
+        conditions.append("lat >= ? AND lat <= ? AND lng >= ? AND lng <= ?")
+        params.extend([lat_min, lat_max, lng_min, lng_max])
+
+    # Boolean filters
+    if request.args.get("has_bathtub") == "1":
+        conditions.append("has_bathtub = 1")
+    if request.args.get("no_agency_fee") == "1":
+        conditions.append("no_agency_fee = 1")
+    if request.args.get("has_washing_machine") == "1":
+        conditions.append("has_washing_machine = 1")
+    if request.args.get("has_dishwasher") == "1":
+        conditions.append("has_dishwasher = 1")
+    if request.args.get("has_air_conditioning") == "1":
+        conditions.append("has_air_conditioning = 1")
+
+    # Heating type filter
+    heating = request.args.get("heating_type")
+    if heating:
+        conditions.append("heating_type LIKE ?")
+        params.append(f"%{heating}%")
+
+    # Text search
+    search = request.args.get("q")
+    if search:
+        conditions.append("(title LIKE ? OR description LIKE ? OR location LIKE ? OR street LIKE ?)")
+        like = f"%{search}%"
+        params.extend([like, like, like, like])
+
+    # Only listings with coordinates (for map)
+    if request.args.get("has_coords") == "1":
+        conditions.append("lat IS NOT NULL AND lng IS NOT NULL")
+
+    # Build query
+    where = " AND ".join(conditions) if conditions else "1=1"
+    limit = request.args.get("limit", 500, type=int)
+    offset = request.args.get("offset", 0, type=int)
+
+    # Count total matching
+    count_row = conn.execute(f"SELECT COUNT(*) FROM listings WHERE {where}", params).fetchone()
+    total = count_row[0]
+
+    # Fetch listings
+    rows = conn.execute(
+        f"SELECT id, title, price, price_eur, location, lat, lng, rooms, area_m2, "
+        f"street, phone, has_bathtub, no_agency_fee, has_washing_machine, "
+        f"has_dishwasher, has_air_conditioning, heating_type, url, available_from, "
+        f"agency_name, furnishing "
+        f"FROM listings WHERE {where} ORDER BY price_eur ASC NULLS LAST "
+        f"LIMIT ? OFFSET ?",
+        params + [limit, offset],
+    ).fetchall()
+
+    listings = []
+    for r in rows:
+        listings.append({
+            "id": r["id"],
+            "title": r["title"],
+            "price": r["price"],
+            "price_eur": r["price_eur"],
+            "location": r["location"],
+            "lat": r["lat"],
+            "lng": r["lng"],
+            "rooms": r["rooms"],
+            "area_m2": r["area_m2"],
+            "street": r["street"],
+            "phone": r["phone"],
+            "has_bathtub": r["has_bathtub"],
+            "no_agency_fee": r["no_agency_fee"],
+            "has_washing_machine": r["has_washing_machine"],
+            "has_dishwasher": r["has_dishwasher"],
+            "has_air_conditioning": r["has_air_conditioning"],
+            "heating_type": r["heating_type"],
+            "url": r["url"],
+            "available_from": r["available_from"],
+            "agency_name": r["agency_name"],
+            "furnishing": r["furnishing"],
+        })
+
+    conn.close()
+    return jsonify({"total": total, "listings": listings})
+
+
+# ─── API: Single listing detail ───────────────────────────────────────────────
+
+@app.route("/api/listings/<listing_id>")
+def api_listing_detail(listing_id):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM listings WHERE id=?", (listing_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+
+    listing = dict(row)
+
+    # Images
+    images = conn.execute(
+        "SELECT url, position FROM images WHERE listing_id=? ORDER BY position",
+        (listing_id,),
+    ).fetchall()
+    listing["images"] = [{"url": img["url"], "position": img["position"]} for img in images]
+
+    # Tags
+    tags = conn.execute(
+        "SELECT category, value FROM listing_tags WHERE listing_id=?",
+        (listing_id,),
+    ).fetchall()
+    tags_dict = {}
+    for t in tags:
+        tags_dict.setdefault(t["category"], []).append(t["value"])
+    listing["tags"] = tags_dict
+
+    conn.close()
+    return jsonify(listing)
+
+
+# ─── API: Stats ───────────────────────────────────────────────────────────────
+
+@app.route("/api/stats")
+def api_stats():
+    conn = get_conn()
+    stats = {}
+    stats["total"] = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+    stats["with_coords"] = conn.execute("SELECT COUNT(*) FROM listings WHERE lat IS NOT NULL").fetchone()[0]
+    stats["with_phone"] = conn.execute("SELECT COUNT(*) FROM listings WHERE phone IS NOT NULL").fetchone()[0]
+    stats["ai_enriched"] = conn.execute("SELECT COUNT(*) FROM listings WHERE ai_enriched_at IS NOT NULL").fetchone()[0]
+    stats["has_bathtub"] = conn.execute("SELECT COUNT(*) FROM listings WHERE has_bathtub=1").fetchone()[0]
+    stats["no_agency_fee"] = conn.execute("SELECT COUNT(*) FROM listings WHERE no_agency_fee=1").fetchone()[0]
+    stats["has_washing_machine"] = conn.execute("SELECT COUNT(*) FROM listings WHERE has_washing_machine=1").fetchone()[0]
+    stats["has_dishwasher"] = conn.execute("SELECT COUNT(*) FROM listings WHERE has_dishwasher=1").fetchone()[0]
+    stats["has_air_conditioning"] = conn.execute("SELECT COUNT(*) FROM listings WHERE has_air_conditioning=1").fetchone()[0]
+
+    price_row = conn.execute(
+        "SELECT MIN(price_eur), MAX(price_eur), ROUND(AVG(price_eur),0) FROM listings WHERE price_eur IS NOT NULL"
+    ).fetchone()
+    stats["price_min"] = price_row[0]
+    stats["price_max"] = price_row[1]
+    stats["price_avg"] = price_row[2]
+
+    conn.close()
+    return jsonify(stats)
+
+
+# ─── API: Filter values ──────────────────────────────────────────────────────
+
+@app.route("/api/filters")
+def api_filters():
+    conn = get_conn()
+
+    # Distinct room types
+    rooms = [r[0] for r in conn.execute(
+        "SELECT DISTINCT rooms FROM listings WHERE rooms IS NOT NULL ORDER BY rooms"
+    ).fetchall()]
+
+    # Distinct heating types
+    heating = [r[0] for r in conn.execute(
+        "SELECT DISTINCT heating_type FROM listings WHERE heating_type IS NOT NULL ORDER BY heating_type"
+    ).fetchall()]
+
+    # Distinct locations (top 50 by count)
+    locations = [r[0] for r in conn.execute(
+        "SELECT location FROM listings WHERE location IS NOT NULL "
+        "GROUP BY location ORDER BY COUNT(*) DESC LIMIT 50"
+    ).fetchall()]
+
+    # Price range
+    price_row = conn.execute(
+        "SELECT MIN(price_eur), MAX(price_eur) FROM listings WHERE price_eur IS NOT NULL"
+    ).fetchone()
+
+    # Area range
+    area_row = conn.execute(
+        "SELECT MIN(area_m2), MAX(area_m2) FROM listings WHERE area_m2 IS NOT NULL"
+    ).fetchone()
+
+    conn.close()
+    return jsonify({
+        "rooms": rooms,
+        "heating_types": heating,
+        "locations": locations,
+        "price_range": [price_row[0], price_row[1]] if price_row[0] else [0, 5000],
+        "area_range": [area_row[0], area_row[1]] if area_row[0] else [0, 500],
+    })
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--host", default="127.0.0.1")
+    args = parser.parse_args()
+    app.run(host=args.host, port=args.port, debug=True)

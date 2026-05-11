@@ -108,6 +108,10 @@ spec = importlib.util.spec_from_file_location("bearer_token_finder", os.path.joi
 bearer_token_finder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bearer_token_finder)
 
+# Import Azure proxy client
+from azure_proxy_client import AzureProxyClient
+azure_proxy_client = AzureProxyClient()
+
 # --- Load proxies from file ---
 def load_proxies_from_file():
     """Load proxies from proxies.txt file"""
@@ -138,11 +142,13 @@ LOADED_PROXIES = load_proxies_from_file()
 current_proxy_index = 0
 proxy_rotation_lock = threading.Lock()
 
-# Timing for cycling system
+# Timing for cycling system — 3 modes: LOCAL, PROXY, AZURE
 LOCAL_SCRAPING_DURATION = 10 * 60  # 10 minutes
 PROXY_SCRAPING_DURATION = 5 * 60   # 5 minutes
+AZURE_SCRAPING_DURATION = 5 * 60   # 5 minutes
 cycle_start_time = time.time()
-is_using_local = True  # Start with local
+# Modes: "local", "proxy", "azure"
+current_cycle_mode = "local"
 
 def get_next_proxy():
     """Get the next proxy in rotation"""
@@ -155,31 +161,39 @@ def get_next_proxy():
         current_proxy_index = (current_proxy_index + 1) % len(LOADED_PROXIES)
         return proxy
 
-def should_use_local_connection():
-    """Determine if we should use local connection based on cycling schedule"""
-    global cycle_start_time, is_using_local
+def get_current_connection_mode():
+    """Determine connection mode based on cycling schedule: local -> proxy -> azure -> local ..."""
+    global cycle_start_time, current_cycle_mode
     
     current_time = time.time()
     elapsed_time = current_time - cycle_start_time
     
-    if is_using_local:
-        # Currently using local for 10 minutes
+    if current_cycle_mode == "local":
         if elapsed_time >= LOCAL_SCRAPING_DURATION:
-            # Switch to proxy mode
-            is_using_local = False
+            current_cycle_mode = "proxy"
             cycle_start_time = current_time
             print(f"[CYCLE] Switching to PROXY mode for {PROXY_SCRAPING_DURATION//60} minutes")
-            return False
-        return True
-    else:
-        # Currently using proxy for 5 minutes
+    elif current_cycle_mode == "proxy":
         if elapsed_time >= PROXY_SCRAPING_DURATION:
-            # Switch to local mode
-            is_using_local = True
+            if azure_proxy_client.available:
+                current_cycle_mode = "azure"
+                cycle_start_time = current_time
+                print(f"[CYCLE] Switching to AZURE mode for {AZURE_SCRAPING_DURATION//60} minutes")
+            else:
+                current_cycle_mode = "local"
+                cycle_start_time = current_time
+                print(f"[CYCLE] Switching to LOCAL mode for {LOCAL_SCRAPING_DURATION//60} minutes")
+    elif current_cycle_mode == "azure":
+        if elapsed_time >= AZURE_SCRAPING_DURATION:
+            current_cycle_mode = "local"
             cycle_start_time = current_time
             print(f"[CYCLE] Switching to LOCAL mode for {LOCAL_SCRAPING_DURATION//60} minutes")
-            return True
-        return False
+    
+    return current_cycle_mode
+
+# Keep backward compat
+def should_use_local_connection():
+    return get_current_connection_mode() == "local"
 
 def extract_ad_id(url):
     """Extract ad ID from Njuskalo URL for cleaner logging"""
@@ -255,6 +269,23 @@ os.makedirs(CATEGORIES_TREE_DIR, exist_ok=True)
 CONCURRENT_LEAFS = 1
 CONCURRENT_ENTRIES = 6
 
+# Preload listing IDs already in the database to skip re-fetching
+def _load_known_listing_ids():
+    db_path = os.path.join(os.path.dirname(__file__), "backend", "listings.db")
+    if not os.path.exists(db_path):
+        return set()
+    try:
+        conn = sqlite3.connect(db_path)
+        ids = {row[0] for row in conn.execute("SELECT id FROM listings")}
+        conn.close()
+        return ids
+    except Exception:
+        return set()
+
+KNOWN_LISTING_IDS = _load_known_listing_ids()
+if KNOWN_LISTING_IDS:
+    print(f"[DB] Loaded {len(KNOWN_LISTING_IDS)} existing listing IDs from listings.db")
+
 import logging
 
 def is_proxy_forbidden(response_text):
@@ -296,21 +327,32 @@ def extract_entry_urls(html):
         log_parsing_failure("extract_entry_urls", str(e), html[:1000])
         return []
 
+async def _fetch_via_azure(url):
+    """Fetch HTML through Azure Function proxy (different region IP)."""
+    ad_id = extract_ad_id(url)
+    try:
+        status, body, region = await azure_proxy_client.fetch(url, headers=HEADERS, cookies=COOKIES)
+        print(f"[AZURE:{region}] {ad_id} -> {status}")
+        log_http_completion(url, status, len(body), f"azure:{region}")
+        return body
+    except Exception as e:
+        log_http_failure(url, str(e), 0, "azure")
+        print(f"[AZURE ERROR] {ad_id}: {e}")
+        return None
+
+
 async def fetch_html(session, url):
-    """Fetch HTML with cycling between local and proxy connections"""
+    """Fetch HTML with cycling between local, proxy, and Azure connections"""
     timeout = 10  # seconds
     
-    use_local = should_use_local_connection()
+    mode = get_current_connection_mode()
     
     try:
-        if use_local:
-            ad_id = extract_ad_id(url)
-            print(f"[LOCAL] {ad_id}")
-            response = await asyncio.wait_for(
-                session.get(url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110"),
-                timeout=timeout
-            )
-        else:
+        if mode == "azure" and azure_proxy_client.available:
+            text = await _fetch_via_azure(url)
+            if text is None:
+                return None
+        elif mode == "proxy":
             # Use proxy from loaded proxy list
             current_proxy = get_next_proxy()
             if current_proxy:
@@ -329,26 +371,42 @@ async def fetch_html(session, url):
                     session.get(url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110"),
                     timeout=timeout
                 )
+            response.raise_for_status()
+            text = getattr(response, "text", "")
+            log_http_completion(url, response.status_code, len(text), "proxy")
+        else:
+            # Local mode
+            ad_id = extract_ad_id(url)
+            print(f"[LOCAL] {ad_id}")
+            response = await asyncio.wait_for(
+                session.get(url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110"),
+                timeout=timeout
+            )
+            response.raise_for_status()
+            text = getattr(response, "text", "")
+            log_http_completion(url, response.status_code, len(text), "local")
         
-        response.raise_for_status()
-        text = getattr(response, "text", "")
-        
-        # Log HTTP success
-        log_http_completion(url, response.status_code, len(text), "proxy" if not use_local else "local")
-        
-        # Enhanced block detection with immediate fallback
+        # Block detection
         import re
         is_shieldsquare_blocked = re.search(r'<title>\s*ShieldSquare Captcha\s*</title>', text, re.IGNORECASE)
         is_general_blocked = is_proxy_forbidden(text)
         
         if is_shieldsquare_blocked or is_general_blocked:
-            if not use_local:
-                print(f"[PROXY BLOCKED] Detected block via proxy, trying next proxy...")
-                
-                # Try next proxy
+            ad_id = extract_ad_id(url)
+            # Try Azure as fallback if not already using it
+            if mode != "azure" and azure_proxy_client.available:
+                print(f"[BLOCK FALLBACK] {ad_id} - Trying Azure proxy...")
+                azure_text = await _fetch_via_azure(url)
+                if azure_text:
+                    # Check Azure response for blocks too
+                    if not re.search(r'<title>\s*ShieldSquare Captcha\s*</title>', azure_text, re.IGNORECASE) \
+                       and not is_proxy_forbidden(azure_text):
+                        return azure_text
+            
+            # Try next regular proxy as fallback
+            if mode != "azure":
                 next_proxy = get_next_proxy()
                 if next_proxy:
-                    ad_id = extract_ad_id(url)
                     proxy_info = next_proxy["http"].split("@")[1] if "@" in next_proxy["http"] else "unknown"
                     print(f"[PROXY RETRY] {ad_id} via {proxy_info}")
                     response = await asyncio.wait_for(
@@ -373,34 +431,17 @@ async def fetch_html(session, url):
         log_http_failure(url, str(e), 0)
         print(f"Error fetching {ad_id}: {e}")
         
-        if not use_local:
-            print(f"[PROXY ERROR] Exception with proxy, trying next proxy...")
-            
-            try:
-                next_proxy = get_next_proxy()
-                if next_proxy:
-                    proxy_info = next_proxy["http"].split("@")[1] if "@" in next_proxy["http"] else "unknown"
-                    print(f"[PROXY RETRY] {ad_id} via {proxy_info}")
-                    response = await asyncio.wait_for(
-                        session.get(url, headers=HEADERS, cookies=COOKIES, impersonate="chrome110", proxies=next_proxy),
-                        timeout=timeout
-                    )
-                    response.raise_for_status()
-                    text = getattr(response, "text", "")
-                    
-                    # Log successful retry
-                    log_http_completion(url, response.status_code, len(text), "proxy_retry")
-                    
-                    # ShieldSquare block detection
-                    import re
-                    if re.search(r'<title>\s*ShieldSquare Captcha\s*</title>', text, re.IGNORECASE):
-                        print(f"[BLOCK DETECTED] {ad_id} - Exiting script and pausing for 1 minute...")
-                        await asyncio.sleep(60)
-                        raise AntibotExit()
-                    return text
-            except Exception as e2:
-                log_http_failure(url, str(e2), 0, "proxy_retry_failed")
-                print(f"Next proxy also failed: {e2}")
+        # On error, try Azure as last resort
+        if mode != "azure" and azure_proxy_client.available:
+            print(f"[AZURE FALLBACK] {ad_id} - Trying Azure after error...")
+            azure_text = await _fetch_via_azure(url)
+            if azure_text:
+                import re
+                if re.search(r'<title>\s*ShieldSquare Captcha\s*</title>', azure_text, re.IGNORECASE):
+                    print(f"[BLOCK DETECTED] {ad_id} via Azure - pausing 1 minute...")
+                    await asyncio.sleep(60)
+                    raise AntibotExit()
+                return azure_text
         
         return None
 
@@ -444,10 +485,18 @@ async def save_entry_html(session, entry_url):
         return False
     conn.close()
     
+    # Skip if already imported into listings.db
+    if ad_id in KNOWN_LISTING_IDS:
+        return False
+    
     # Use only ad_id for filename (no datetime)
     filename = f"{ad_id}.html"
     save_path = os.path.join(BACKEND_WEBSITE_DIR, filename)
     log_path = os.path.join(BACKEND_LOGS_DIR, f"{ad_id}.log")
+    
+    # Skip if HTML already exists on disk
+    if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
+        return False
     
     t0 = time.time()
     html = await fetch_html(session, entry_url)
