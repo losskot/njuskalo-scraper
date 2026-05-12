@@ -162,7 +162,7 @@ def api_listings():
         f"SELECT id, title, price, price_eur, location, lat, lng, rooms, area_m2, "
         f"street, phone, has_bathtub, no_agency_fee, has_washing_machine, "
         f"has_dishwasher, has_air_conditioning, heating_type, url, available_from, "
-        f"published_at, agency_name, furnishing, starred, no_label "
+        f"published_at, agency_name, furnishing, starred, no_label, read_at "
         f"FROM listings WHERE {where} ORDER BY price_eur ASC NULLS LAST "
         f"LIMIT ? OFFSET ?",
         params + [fetch_limit, offset],
@@ -219,6 +219,7 @@ def api_listings():
             "furnishing": r["furnishing"],
             "starred": r["starred"],
             "no_label": r["no_label"],
+            "read_at": r["read_at"],
         })
 
     conn.close()
@@ -392,6 +393,27 @@ def api_update_tags(listing_id):
 
     conn.close()
     return jsonify({"updated": updates})
+
+
+# ─── API: Mark as read ──────────────────────────────────────────────────────
+
+@app.route("/api/listings/<listing_id>/read", methods=["POST"])
+def api_mark_read(listing_id):
+    conn = get_conn()
+    row = conn.execute("SELECT read_at FROM listings WHERE id=?", (listing_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    # Toggle: if already read, clear; otherwise set
+    if row["read_at"]:
+        conn.execute("UPDATE listings SET read_at=NULL WHERE id=?", (listing_id,))
+        new_read_at = None
+    else:
+        new_read_at = datetime.utcnow().isoformat()
+        conn.execute("UPDATE listings SET read_at=? WHERE id=?", (new_read_at, listing_id))
+    conn.commit()
+    conn.close()
+    return jsonify({"read_at": new_read_at})
 
 
 if __name__ == "__main__":

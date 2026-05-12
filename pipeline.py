@@ -6,7 +6,7 @@ Njuskalo Scraping Pipeline
 3-step pipeline — everything goes into listings.db (no intermediate files):
 
 1. njuskalo_category_tree_scraper.py — Scrape category tree → DB (categories, leaf_urls)
-2. scrape_and_parse.py — Download HTML → parse → fetch phone → insert into DB
+2. scrape_and_parse.py — Download HTML → parse → insert into DB (phone optional, see --fetch-phones)
 3. ai_enrich.py — AI enrichment (agency fee, appliances, bathtub vision)
 
 Usage:
@@ -15,6 +15,7 @@ Usage:
 Options:
     --step STEP         Run specific step only (1-3)
     --skip-existing     Skip steps if output already exists in DB
+    --fetch-phones      Fetch phone numbers via API (requires Playwright, off by default)
 """
 
 import os
@@ -44,10 +45,12 @@ DEFAULT_PRICE_MAX = 1200
 
 
 class PipelineRunner:
-    def __init__(self, skip_existing=False, price_min=None, price_max=None):
+    def __init__(self, skip_existing=False, price_min=None, price_max=None, restart=False, fetch_phones=False):
         self.skip_existing = skip_existing
         self.price_min = price_min
         self.price_max = price_max
+        self.restart = restart
+        self.fetch_phones = fetch_phones
         self.start_time = time.time()
         self.step_times = {}
 
@@ -116,7 +119,7 @@ class PipelineRunner:
         )
 
     def step2_scrape_and_parse(self):
-        """Step 2: Download + parse + phone → DB (unified scraper)."""
+        """Step 2: Download + parse → DB (phone optional, use --fetch-phones to enable)."""
         if self.skip_existing and self._db_has_rows("listings", 10):
             logging.info("⏭️  STEP 2 SKIPPED: listings table already has data")
             return True
@@ -125,7 +128,13 @@ class PipelineRunner:
             extra += ["--price-min", str(self.price_min)]
         if self.price_max is not None:
             extra += ["--price-max", str(self.price_max)]
-        desc = 'Download HTML → parse → fetch phone → insert into DB'
+        if self.restart:
+            extra += ["--restart"]
+        if self.fetch_phones:
+            extra += ["--fetch-phones"]
+        desc = 'Download HTML → parse → insert into DB'
+        if self.fetch_phones:
+            desc = 'Download HTML → parse → fetch phone → insert into DB'
         if extra:
             desc += f' (price: {self.price_min or "*"}–{self.price_max or "*"}€)'
         return self.run_script('scrape_and_parse.py', 2, desc, extra_args=extra)
@@ -153,7 +162,7 @@ class PipelineRunner:
 
         steps = [
             (self.step1_category_scraper, "Category Scraper"),
-            (self.step2_scrape_and_parse, "Scrape + Parse + Phone"),
+            (self.step2_scrape_and_parse, "Scrape + Parse"),
             (self.step3_ai_enrich, "AI Enrichment"),
         ]
 
@@ -200,7 +209,7 @@ class PipelineRunner:
         """Run a single step."""
         steps = {
             1: (self.step1_category_scraper, "Category Scraper"),
-            2: (self.step2_scrape_and_parse, "Scrape + Parse + Phone"),
+            2: (self.step2_scrape_and_parse, "Scrape + Parse"),
             3: (self.step3_ai_enrich, "AI Enrichment"),
         }
         if step_num not in steps:
@@ -233,12 +242,18 @@ def main():
                         help=f'Min price filter in EUR (default: {DEFAULT_PRICE_MIN})')
     parser.add_argument('--price-max', type=int, default=DEFAULT_PRICE_MAX,
                         help=f'Max price filter in EUR (default: {DEFAULT_PRICE_MAX})')
+    parser.add_argument('--restart', action='store_true',
+                        help='Ignore checkpoints, re-scan all leaf URLs from scratch')
+    parser.add_argument('--fetch-phones', action='store_true', default=False,
+                        help='Fetch phone numbers via Njuskalo API (requires Playwright, off by default)')
     args = parser.parse_args()
 
     runner = PipelineRunner(
         skip_existing=args.skip_existing,
         price_min=args.price_min,
         price_max=args.price_max,
+        restart=args.restart,
+        fetch_phones=args.fetch_phones,
     )
 
     try:

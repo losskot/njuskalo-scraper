@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-scrape_and_parse.py — Unified scraper: download HTML → parse in-memory → fetch phone → insert into DB.
+scrape_and_parse.py — Unified scraper: download HTML → parse in-memory → insert into DB.
+
+Phone fetching is optional and disabled by default (use --fetch-phones to enable).
 
 Replaces: scrape_leaf_entries.py + parser_ultrafast.py + fetch_phones_from_api.py
 
 Usage:
-    python scrape_and_parse.py [--restart]
+    python scrape_and_parse.py [--restart] [--fetch-phones]
 """
 import asyncio
 import importlib.util
@@ -35,6 +37,9 @@ CONCURRENT_ENTRIES = 6
 # Price filter (set via CLI args, applied to leaf URL pagination)
 PRICE_MIN = None
 PRICE_MAX = None
+
+# Phone fetching (set via --fetch-phones CLI flag, off by default)
+FETCH_PHONES = False
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -442,18 +447,19 @@ async def process_entry(session, entry_url, bearer_token, db_conn):
     # 2. Parse in-memory
     parsed = parse_listing_html(html, ad_id)
 
-    # 3. Fetch phone inline
-    token = HEADERS.get("authorization", "").replace("Bearer ", "")
-    if token:
-        phone = await fetch_phone(session, ad_id, token, COOKIES)
-        if phone == "REFRESH_TOKEN":
-            new_token, new_cookies = await refresh_headers_and_cookies()
-            if new_token:
-                phone = await fetch_phone(session, ad_id, new_token, new_cookies)
-            else:
-                phone = None
-        if phone and phone != "REFRESH_TOKEN":
-            parsed["telefon"] = phone
+    # 3. Fetch phone inline (only when --fetch-phones is enabled)
+    if FETCH_PHONES:
+        token = HEADERS.get("authorization", "").replace("Bearer ", "")
+        if token:
+            phone = await fetch_phone(session, ad_id, token, COOKIES)
+            if phone == "REFRESH_TOKEN":
+                new_token, new_cookies = await refresh_headers_and_cookies()
+                if new_token:
+                    phone = await fetch_phone(session, ad_id, new_token, new_cookies)
+                else:
+                    phone = None
+            if phone and phone != "REFRESH_TOKEN":
+                parsed["telefon"] = phone
 
     # 4. Insert into DB
     upsert_listing(db_conn, parsed)
@@ -550,31 +556,40 @@ async def process_leaf_url(session, leaf_url, bearer_token, db_conn):
 
 
 async def main():
-    global PRICE_MIN, PRICE_MAX
+    global PRICE_MIN, PRICE_MAX, FETCH_PHONES
     import argparse
     parser = argparse.ArgumentParser(description="Unified scraper: download + parse + phone → DB")
     parser.add_argument("--restart", action="store_true", help="Ignore checkpoints, start from scratch")
     parser.add_argument("--price-min", type=int, default=None, help="Min price filter (EUR)")
     parser.add_argument("--price-max", type=int, default=None, help="Max price filter (EUR)")
+    parser.add_argument("--fetch-phones", action="store_true", default=False,
+                        help="Fetch phone numbers via Njuskalo API (requires Playwright, off by default)")
     args = parser.parse_args()
 
     PRICE_MIN = args.price_min
     PRICE_MAX = args.price_max
+    FETCH_PHONES = args.fetch_phones
     if PRICE_MIN or PRICE_MAX:
         log.info(f"Price filter: {PRICE_MIN or '∞'}€ – {PRICE_MAX or '∞'}€")
+    if FETCH_PHONES:
+        log.info("Phone fetching: enabled")
+    else:
+        log.info("Phone fetching: disabled (use --fetch-phones to enable)")
 
     log.info("Starting unified scrape_and_parse...")
 
-    # Get bearer token
-    token, cookies = await bearer_token_finder.get_bearer_token_and_cookies(headless=True)
-    if token:
-        HEADERS["authorization"] = f"Bearer {token}"
-    if cookies:
-        COOKIES.update(cookies)
+    # Get bearer token (only needed for phone fetching)
+    token = None
+    if FETCH_PHONES:
+        token, cookies = await bearer_token_finder.get_bearer_token_and_cookies(headless=True)
+        if token:
+            HEADERS["authorization"] = f"Bearer {token}"
+        if cookies:
+            COOKIES.update(cookies)
 
-    if not token:
-        log.error("Could not get bearer token. Exiting.")
-        sys.exit(1)
+        if not token:
+            log.error("Could not get bearer token. Exiting.")
+            sys.exit(1)
 
     # Load leaf URLs from DB
     db_conn = get_db()
@@ -598,34 +613,37 @@ async def main():
     total_saved = 0
     start_time = time.time()
 
-    async with AsyncSession() as session:
-        for idx, leaf_url in enumerate(leaf_urls[last_idx:], start=last_idx):
-            # Refresh token every 50 leaf URLs
-            if idx > 0 and idx % 50 == 0:
-                await refresh_headers_and_cookies()
+    try:
+        async with AsyncSession() as session:
+            for idx, leaf_url in enumerate(leaf_urls[last_idx:], start=last_idx):
+                # Refresh token every 50 leaf URLs (only when phone fetching is on)
+                if FETCH_PHONES and idx > 0 and idx % 50 == 0:
+                    await refresh_headers_and_cookies()
 
-            try:
-                saved, total = await process_leaf_url(session, leaf_url, token, db_conn)
-            except AntibotExit:
+                try:
+                    saved, total = await process_leaf_url(session, leaf_url, token, db_conn)
+                except AntibotExit:
+                    db_conn.commit()
+                    set_checkpoint(db_conn, checkpoint_key, {"last_index": idx})
+                    log.error(f"Anti-bot exit at leaf {idx + 1}/{len(leaf_urls)}. Progress saved.")
+                    raise
+
+                total_saved += saved
                 db_conn.commit()
-                set_checkpoint(db_conn, checkpoint_key, {"last_index": idx})
-                log.error(f"Anti-bot exit at leaf {idx + 1}/{len(leaf_urls)}. Progress saved.")
-                raise
 
-            total_saved += saved
-            db_conn.commit()
+                set_checkpoint(db_conn, checkpoint_key, {"last_index": idx + 1})
 
-            set_checkpoint(db_conn, checkpoint_key, {"last_index": idx + 1})
+                elapsed = time.time() - start_time
+                log.info(
+                    f"Leaf {idx + 1}/{len(leaf_urls)}: saved {saved}/{total} entries "
+                    f"(total: {total_saved}, elapsed: {elapsed:.0f}s)"
+                )
 
-            elapsed = time.time() - start_time
-            log.info(
-                f"Leaf {idx + 1}/{len(leaf_urls)}: saved {saved}/{total} entries "
-                f"(total: {total_saved}, elapsed: {elapsed:.0f}s)"
-            )
-
-    log_event(db_conn, "INFO", "scrape_and_parse", f"Completed. Saved {total_saved} listings in {time.time()-start_time:.0f}s")
-    db_conn.close()
-    log.info(f"Done. Total new listings: {total_saved}")
+        log_event(db_conn, "INFO", "scrape_and_parse", f"Completed. Saved {total_saved} listings in {time.time()-start_time:.0f}s")
+        db_conn.close()
+        log.info(f"Done. Total new listings: {total_saved}")
+    finally:
+        await azure_proxy_client.close()
 
 
 if __name__ == "__main__":

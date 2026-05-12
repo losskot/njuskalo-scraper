@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS listings (
     bathtub_analyzed_at TEXT,
     starred             INTEGER DEFAULT 0,
     no_label            INTEGER DEFAULT 0,
+    read_at             TEXT,
     -- Metadata
     scraped_at          TEXT
 );
@@ -175,6 +176,7 @@ def init_db():
         ("bathtub_analyzed_at", "TEXT"),
         ("starred", "INTEGER DEFAULT 0"),
         ("no_label", "INTEGER DEFAULT 0"),
+        ("read_at", "TEXT"),
         ("scraped_at", "TEXT"),
     ]
     existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(listings)").fetchall()}
