@@ -12,6 +12,7 @@ Auth: uses Azure CLI credentials (az login already done).
 
 import argparse
 import base64
+import io
 import json
 import logging
 import os
@@ -24,8 +25,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime, timezone
 
-from azure.identity import AzureCliCredential
-from openai import AzureOpenAI, RateLimitError, APIStatusError
+from azure.identity import AzureCliCredential, DefaultAzureCredential, get_bearer_token_provider
+from openai import AzureOpenAI, OpenAI, RateLimitError, APIStatusError
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Config
@@ -48,6 +50,7 @@ VISION_MODELS = [
 IMAGES_DIR = Path(__file__).parent / "backend" / "images"
 DB_PATH    = Path(__file__).parent / "backend" / "bathtub_results.db"
 HTML_OUT   = Path(__file__).parent / "backend" / "website" / "bathtub_report.html"
+CHECKPOINTS_DIR = Path(__file__).parent / "checkpoints"
 
 VALID_CATEGORIES = {
     "not_bathroom",
@@ -197,6 +200,49 @@ class ClientHolder:
                 log.info("Refreshing Azure AD token...")
                 self._refresh()
             return self._client
+
+# ---------------------------------------------------------------------------
+# Batch API client  (uses OpenAI client with v1 URL for files/batches API)
+# ---------------------------------------------------------------------------
+
+_AZURE_RESOURCE_NAME = AZURE_ENDPOINT.rstrip("/").split("//")[1].split(".")[0]
+
+class BatchClientHolder:
+    """Client for Azure OpenAI Batch API (files.create, batches.create, etc.).
+    Uses the OpenAI SDK with the v1 base URL pattern required by the batch API."""
+    def __init__(self):
+        self._token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+        )
+        self._client = OpenAI(
+            base_url=f"https://{_AZURE_RESOURCE_NAME}.openai.azure.com/openai/v1/",
+            api_key=self._token_provider(),
+        )
+        log.info("BatchClientHolder initialised (v1 URL)")
+
+    def get(self) -> OpenAI:
+        # Refresh the api_key (bearer token) on each access
+        self._client.api_key = self._token_provider()
+        return self._client
+
+# ---------------------------------------------------------------------------
+# Image resizing  (max 2048px longest side, JPEG q85)
+# ---------------------------------------------------------------------------
+
+MAX_IMAGE_DIM = 2048
+
+def resize_and_encode(path: Path, max_dim: int = MAX_IMAGE_DIM) -> str:
+    """Open image, resize longest side to max_dim (if larger), return base64 JPEG."""
+    img = Image.open(path)
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # ---------------------------------------------------------------------------
 # Adaptive rate-limit state (per model)
@@ -538,6 +584,390 @@ def run_all(models: list[str], images: list[dict], conn: sqlite3.Connection,
                 log.error(f"Thread for {model} crashed: {e}")
 
 # ---------------------------------------------------------------------------
+# Batch API — JSONL builder
+# ---------------------------------------------------------------------------
+
+MAX_JSONL_BYTES = 180 * 1024 * 1024  # 180 MB split threshold
+
+def _build_chat_body(model: str, b64: str) -> dict:
+    """Build the chat completions request body for a single image (same logic as classify_image)."""
+    body: dict = dict(
+        model=model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{b64}",
+                            "detail": "high",
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                    },
+                ],
+            }
+        ],
+        response_format={"type": "json_object"},
+    )
+    if model.startswith("gpt-4"):
+        body["max_tokens"] = 512
+        body["temperature"] = 0
+    else:
+        body["max_completion_tokens"] = 512
+    return body
+
+
+def build_batch_jsonl(
+    model: str,
+    images: list[dict],
+    conn: sqlite3.Connection,
+    db_lock: threading.Lock | None = None,
+) -> list[Path]:
+    """Build JSONL file(s) for the given model, skipping already-done images.
+    Returns list of written file paths (empty if nothing to do)."""
+    CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_model = model.replace(".", "_").replace("-", "_")
+
+    paths: list[Path] = []
+    chunk_idx = 0
+    current_size = 0
+    current_fh = None
+
+    def _open_chunk():
+        nonlocal chunk_idx, current_size, current_fh
+        if current_fh:
+            current_fh.close()
+        suffix = f"_{chunk_idx}" if chunk_idx > 0 else ""
+        p = CHECKPOINTS_DIR / f"batch_{safe_model}_{ts}{suffix}.jsonl"
+        current_fh = open(p, "w", encoding="utf-8")
+        paths.append(p)
+        current_size = 0
+        chunk_idx += 1
+
+    written = 0
+    skipped = 0
+    for img in images:
+        if db_lock:
+            with db_lock:
+                done = is_already_done(conn, model, img["image_path"])
+        else:
+            done = is_already_done(conn, model, img["image_path"])
+        if done:
+            skipped += 1
+            continue
+
+        b64 = resize_and_encode(img["path_obj"])
+        body = _build_chat_body(model, b64)
+        line = json.dumps({
+            "custom_id": f"{img['listing_id']}::{img['image_path']}",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": body,
+        }, ensure_ascii=False)
+
+        line_bytes = len(line.encode("utf-8")) + 1  # +1 for newline
+
+        if current_fh is None or (current_size + line_bytes > MAX_JSONL_BYTES):
+            _open_chunk()
+
+        current_fh.write(line + "\n")
+        current_size += line_bytes
+        written += 1
+
+    if current_fh:
+        current_fh.close()
+
+    # Remove empty files (shouldn't happen, but be safe)
+    paths = [p for p in paths if p.stat().st_size > 0]
+
+    log.info(f"[{model}] Built {len(paths)} JSONL file(s): {written} images, {skipped} skipped (already done)")
+    for p in paths:
+        log.info(f"  → {p}  ({p.stat().st_size / 1024 / 1024:.1f} MB)")
+    return paths
+
+# ---------------------------------------------------------------------------
+# Batch API — submit
+# ---------------------------------------------------------------------------
+
+def submit_batches(
+    models: list[str],
+    images: list[dict],
+    conn: sqlite3.Connection,
+) -> Path:
+    """Build JSONL files and submit batch jobs for all models.
+    Returns path to the tracking JSON file."""
+    holder = BatchClientHolder()
+    client = holder.get()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tracking_path = CHECKPOINTS_DIR / f"batch_jobs_{ts}.json"
+
+    tracking: dict[str, dict] = {}
+
+    for model in models:
+        jsonl_paths = build_batch_jsonl(model, images, conn)
+        if not jsonl_paths:
+            log.info(f"[{model}] Nothing to submit (all images already done)")
+            continue
+
+        for jsonl_path in jsonl_paths:
+            client = holder.get()  # refresh token
+            log.info(f"[{model}] Uploading {jsonl_path.name} ...")
+            with open(jsonl_path, "rb") as f:
+                file_obj = client.files.create(
+                    file=f,
+                    purpose="batch",
+                    extra_body={"expires_after": {"seconds": 1209600, "anchor": "created_at"}},
+                )
+            log.info(f"[{model}] File uploaded: {file_obj.id}")
+
+            batch_resp = client.batches.create(
+                input_file_id=file_obj.id,
+                endpoint="/chat/completions",
+                completion_window="24h",
+            )
+            log.info(f"[{model}] Batch submitted: {batch_resp.id} (status={batch_resp.status})")
+
+            tracking[batch_resp.id] = {
+                "model": model,
+                "status": batch_resp.status,
+                "input_file_id": file_obj.id,
+                "jsonl_path": str(jsonl_path),
+                "submitted_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+    tracking_path.write_text(json.dumps(tracking, indent=2), encoding="utf-8")
+    log.info(f"Tracking file: {tracking_path}  ({len(tracking)} batch job(s))")
+    return tracking_path
+
+# ---------------------------------------------------------------------------
+# Batch API — poll
+# ---------------------------------------------------------------------------
+
+POLL_INTERVAL = 60  # seconds
+
+def poll_batches(tracking_path: Path) -> dict:
+    """Poll all batch jobs until they reach a terminal state. Updates tracking file in-place."""
+    tracking = json.loads(tracking_path.read_text())
+    if not tracking:
+        log.info("No batch jobs to poll.")
+        return tracking
+
+    holder = BatchClientHolder()
+
+    terminal = {"completed", "failed", "cancelled", "expired"}
+    while True:
+        pending = []
+        for batch_id, info in tracking.items():
+            if info["status"] in terminal:
+                continue
+            pending.append(batch_id)
+
+        if not pending:
+            log.info("All batch jobs have reached a terminal state.")
+            break
+
+        log.info(f"Polling {len(pending)} pending batch job(s)...")
+        client = holder.get()
+        for batch_id in pending:
+            resp = client.batches.retrieve(batch_id)
+            old_status = tracking[batch_id]["status"]
+            tracking[batch_id]["status"] = resp.status
+            if resp.output_file_id:
+                tracking[batch_id]["output_file_id"] = resp.output_file_id
+            if resp.error_file_id:
+                tracking[batch_id]["error_file_id"] = resp.error_file_id
+            if resp.request_counts:
+                tracking[batch_id]["request_counts"] = {
+                    "total": resp.request_counts.total,
+                    "completed": resp.request_counts.completed,
+                    "failed": resp.request_counts.failed,
+                }
+            model = tracking[batch_id]["model"]
+            counts = tracking[batch_id].get("request_counts", {})
+            log.info(
+                f"  [{model}] {batch_id}: {old_status} → {resp.status}  "
+                f"(completed={counts.get('completed', '?')}/{counts.get('total', '?')})"
+            )
+
+        # Save progress
+        tracking_path.write_text(json.dumps(tracking, indent=2), encoding="utf-8")
+
+        # Check again if all done
+        if all(tracking[bid]["status"] in terminal for bid in tracking):
+            log.info("All batch jobs have reached a terminal state.")
+            break
+
+        log.info(f"Waiting {POLL_INTERVAL}s before next poll...")
+        time.sleep(POLL_INTERVAL)
+
+    return tracking
+
+# ---------------------------------------------------------------------------
+# Batch API — collect results
+# ---------------------------------------------------------------------------
+
+def _parse_batch_response(raw_text: str) -> dict:
+    """Parse the model output from a batch response (same logic as classify_image)."""
+    text = (raw_text or "").strip()
+    text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s*```$', '', text)
+    text = text.strip()
+    try:
+        data = json.loads(text)
+        category = data.get("category", "")
+        confidence = float(data.get("confidence", 0.0))
+        fixtures = json.dumps(data.get("visible_fixtures", []))
+        reasoning = data.get("reasoning", "")
+        if category not in VALID_CATEGORIES:
+            raise ValueError(f"Unknown category: {category!r}")
+        return dict(
+            category=category, confidence=confidence, fixtures=fixtures,
+            reasoning=reasoning, raw_response=raw_text, error=None, latency_ms=0,
+        )
+    except Exception as e:
+        return dict(
+            category=None, confidence=None, fixtures=None,
+            reasoning=None, raw_response=raw_text,
+            error=f"JSONParseError: {e}", latency_ms=0,
+        )
+
+
+def collect_results(tracking_path: Path, conn: sqlite3.Connection):
+    """Download results from completed batch jobs and insert into the database."""
+    tracking = json.loads(tracking_path.read_text())
+    holder = BatchClientHolder()
+    client = holder.get()
+
+    total_saved = 0
+    total_errors = 0
+
+    for batch_id, info in tracking.items():
+        model = info["model"]
+        status = info["status"]
+
+        if status != "completed":
+            counts = info.get("request_counts", {})
+            log.warning(f"[{model}] Batch {batch_id} status={status}, skipping. "
+                        f"(failed={counts.get('failed', '?')})")
+            # Try to download error file
+            error_file_id = info.get("error_file_id")
+            if error_file_id:
+                try:
+                    client = holder.get()
+                    err_content = client.files.content(error_file_id)
+                    for line in err_content.text.strip().split("\n"):
+                        if line.strip():
+                            log.error(f"  [error] {line[:300]}")
+                except Exception as e:
+                    log.error(f"  Could not download error file: {e}")
+            continue
+
+        output_file_id = info.get("output_file_id")
+        if not output_file_id:
+            log.warning(f"[{model}] Batch {batch_id} completed but no output_file_id")
+            continue
+
+        log.info(f"[{model}] Downloading results from {batch_id} ...")
+        client = holder.get()
+        file_response = client.files.content(output_file_id)
+        lines = file_response.text.strip().split("\n")
+        batch_saved = 0
+        batch_errors = 0
+
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                resp_obj = json.loads(line)
+            except json.JSONDecodeError as e:
+                log.error(f"  Failed to parse result line: {e}")
+                batch_errors += 1
+                continue
+
+            custom_id = resp_obj.get("custom_id", "")
+            # Parse custom_id: "{listing_id}::{image_path}"
+            parts = custom_id.split("::", 1)
+            if len(parts) != 2:
+                log.error(f"  Invalid custom_id format: {custom_id[:100]}")
+                batch_errors += 1
+                continue
+            listing_id, image_path = parts
+            image_file = Path(image_path).name
+
+            # Check for request-level error
+            error = resp_obj.get("error")
+            if error:
+                save_result(
+                    conn, model=model, listing_id=listing_id,
+                    image_file=image_file, image_path=image_path,
+                    category=None, confidence=None, fixtures=None,
+                    reasoning=None, raw_response=json.dumps(error),
+                    error=f"BatchError: {json.dumps(error)}", latency_ms=0,
+                )
+                batch_errors += 1
+                continue
+
+            # Extract the assistant message content
+            response_body = resp_obj.get("response", {}).get("body", {})
+            status_code = resp_obj.get("response", {}).get("status_code", 0)
+            if status_code != 200:
+                save_result(
+                    conn, model=model, listing_id=listing_id,
+                    image_file=image_file, image_path=image_path,
+                    category=None, confidence=None, fixtures=None,
+                    reasoning=None, raw_response=json.dumps(response_body),
+                    error=f"HTTP {status_code}", latency_ms=0,
+                )
+                batch_errors += 1
+                continue
+
+            choices = response_body.get("choices", [])
+            if not choices:
+                save_result(
+                    conn, model=model, listing_id=listing_id,
+                    image_file=image_file, image_path=image_path,
+                    category=None, confidence=None, fixtures=None,
+                    reasoning=None, raw_response=json.dumps(response_body),
+                    error="No choices in response", latency_ms=0,
+                )
+                batch_errors += 1
+                continue
+
+            raw_text = choices[0].get("message", {}).get("content", "")
+            result = _parse_batch_response(raw_text)
+
+            save_result(
+                conn, model=model, listing_id=listing_id,
+                image_file=image_file, image_path=image_path,
+                **result,
+            )
+            if result["error"]:
+                batch_errors += 1
+            else:
+                batch_saved += 1
+
+        total_saved += batch_saved
+        total_errors += batch_errors
+        log.info(f"[{model}] Batch {batch_id}: {batch_saved} saved, {batch_errors} errors")
+
+        # Clean up: delete the uploaded input file to stay under the 500-file limit
+        input_file_id = info.get("input_file_id")
+        if input_file_id:
+            try:
+                client = holder.get()
+                client.files.delete(input_file_id)
+                log.info(f"[{model}] Deleted input file {input_file_id}")
+            except Exception as e:
+                log.warning(f"[{model}] Could not delete input file {input_file_id}: {e}")
+
+    log.info(f"Collection complete: {total_saved} results saved, {total_errors} errors across all batches")
+
+# ---------------------------------------------------------------------------
 # HTML report
 # ---------------------------------------------------------------------------
 
@@ -696,7 +1126,17 @@ def parse_args():
     p.add_argument("--models",     nargs="+", default=VISION_MODELS, help="Models to test")
     p.add_argument("--limit",      type=int,  default=None, help="Limit number of images (for testing)")
     p.add_argument("--html-only",  action="store_true",     help="Skip classification, just regenerate HTML from DB")
+    p.add_argument("--batch",      choices=["submit", "poll", "collect", "run"],
+                   default=None,   help="Batch API mode: submit/poll/collect or run (all three)")
+    p.add_argument("--tracking-file", default=None,
+                   help="Path to batch tracking JSON (for poll/collect; defaults to most recent)")
     return p.parse_args()
+
+
+def _find_latest_tracking_file() -> Path | None:
+    """Find the most recent batch_jobs_*.json in checkpoints/."""
+    candidates = sorted(CHECKPOINTS_DIR.glob("batch_jobs_*.json"), reverse=True)
+    return candidates[0] if candidates else None
 
 
 def main():
@@ -709,16 +1149,55 @@ def main():
 
     conn = init_db(db_path)
 
-    if not args.html_only:
+    if args.batch:
+        # --- Batch API mode ---
+        images = collect_images(images_dir)
+        if args.limit:
+            images = images[:args.limit]
+        log.info(f"Found {len(images)} images across {len(set(i['listing_id'] for i in images))} listings")
+        log.info(f"Models: {models}")
+
+        tracking_path = Path(args.tracking_file) if args.tracking_file else None
+
+        if args.batch in ("submit", "run"):
+            tracking_path = submit_batches(models, images, conn)
+
+        if args.batch in ("poll", "run"):
+            if tracking_path is None:
+                tracking_path = _find_latest_tracking_file()
+            if tracking_path is None or not tracking_path.exists():
+                log.error("No tracking file found. Run --batch submit first.")
+                sys.exit(1)
+            log.info(f"Polling: {tracking_path}")
+            poll_batches(tracking_path)
+
+        if args.batch in ("collect", "run"):
+            if tracking_path is None:
+                tracking_path = _find_latest_tracking_file()
+            if tracking_path is None or not tracking_path.exists():
+                log.error("No tracking file found. Run --batch submit first.")
+                sys.exit(1)
+            log.info(f"Collecting results: {tracking_path}")
+            collect_results(tracking_path, conn)
+
+        log.info("Building HTML report...")
+        build_html(conn, models, html_out)
+
+    elif not args.html_only:
+        # --- Real-time mode (existing behavior) ---
         images = collect_images(images_dir)
         log.info(f"Found {len(images)} images across {len(set(i['listing_id'] for i in images))} listings")
         log.info(f"Models: {models}")
         if args.limit:
             log.info(f"Limiting to first {args.limit} images")
         run_all(models, images, conn, limit=args.limit)
+        log.info("Building HTML report...")
+        build_html(conn, models, html_out)
 
-    log.info("Building HTML report...")
-    build_html(conn, models, html_out)
+    else:
+        log.info("Building HTML report...")
+        build_html(conn, models, html_out)
+
     conn.close()
     log.info("Done.")
 

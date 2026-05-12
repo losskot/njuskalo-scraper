@@ -114,6 +114,8 @@ def api_listings():
         conditions.append("has_air_conditioning = 1")
     if request.args.get("starred") == "1":
         conditions.append("starred = 1")
+    if request.args.get("no_label") == "1":
+        conditions.append("no_label = 1")
 
     # Heating type filter
     heating = request.args.get("heating_type")
@@ -143,21 +145,38 @@ def api_listings():
     avail_after = datetime.fromisoformat(avail_after_str) if avail_after_str else None
     avail_before = datetime.fromisoformat(avail_before_str) if avail_before_str else None
 
+    # Published date filter (parsed in Python — stored as "DD.MM.YYYY." Croatian format)
+    pub_after_str = request.args.get("published_after")   # ISO date: YYYY-MM-DD
+    pub_before_str = request.args.get("published_before")  # ISO date: YYYY-MM-DD
+    pub_after = datetime.fromisoformat(pub_after_str) if pub_after_str else None
+    pub_before = datetime.fromisoformat(pub_before_str) if pub_before_str else None
+
     # Count total matching (without date filter — date filter is post-SQL)
     count_row = conn.execute(f"SELECT COUNT(*) FROM listings WHERE {where}", params).fetchone()
     total = count_row[0]
 
     # Fetch listings (use higher limit when date filter active to compensate for post-SQL filtering)
-    fetch_limit = limit * 4 if (avail_after or avail_before) else limit
+    has_date_filter = avail_after or avail_before or pub_after or pub_before
+    fetch_limit = limit * 4 if has_date_filter else limit
     rows = conn.execute(
         f"SELECT id, title, price, price_eur, location, lat, lng, rooms, area_m2, "
         f"street, phone, has_bathtub, no_agency_fee, has_washing_machine, "
         f"has_dishwasher, has_air_conditioning, heating_type, url, available_from, "
-        f"agency_name, furnishing, starred "
+        f"published_at, agency_name, furnishing, starred, no_label "
         f"FROM listings WHERE {where} ORDER BY price_eur ASC NULLS LAST "
         f"LIMIT ? OFFSET ?",
         params + [fetch_limit, offset],
     ).fetchall()
+
+    def parse_published_at(s):
+        """Parse Croatian-format published_at like '24.04.2026.' or '24.04.2026. u 10:30'."""
+        if not s:
+            return None
+        s = s.split(" u ")[0].strip().rstrip(".")
+        try:
+            return datetime.strptime(s, "%d.%m.%Y")
+        except (ValueError, TypeError):
+            return None
 
     listings = []
     for r in rows:
@@ -167,6 +186,13 @@ def api_listings():
             if avail_after and (avail_dt is None or avail_dt < avail_after):
                 continue
             if avail_before and (avail_dt is None or avail_dt > avail_before):
+                continue
+        # Apply published date filter in Python
+        if pub_after or pub_before:
+            pub_dt = parse_published_at(r["published_at"])
+            if pub_after and (pub_dt is None or pub_dt < pub_after):
+                continue
+            if pub_before and (pub_dt is None or pub_dt > pub_before):
                 continue
         listings.append({
             "id": r["id"],
@@ -188,9 +214,11 @@ def api_listings():
             "heating_type": r["heating_type"],
             "url": r["url"],
             "available_from": r["available_from"],
+            "published_at": r["published_at"],
             "agency_name": r["agency_name"],
             "furnishing": r["furnishing"],
             "starred": r["starred"],
+            "no_label": r["no_label"],
         })
 
     conn.close()
@@ -309,14 +337,38 @@ def api_toggle_star(listing_id):
     if not row:
         conn.close()
         return jsonify({"error": "not found"}), 404
-    new_val = 0 if row["starred"] else 1
-    conn.execute("UPDATE listings SET starred=? WHERE id=?", (new_val, listing_id))
+    new_starred = 0 if row["starred"] else 1
+    # Mutual exclusion: starring clears no_label
+    if new_starred:
+        conn.execute("UPDATE listings SET starred=1, no_label=0 WHERE id=?", (listing_id,))
+    else:
+        conn.execute("UPDATE listings SET starred=0 WHERE id=?", (listing_id,))
     conn.commit()
     conn.close()
-    return jsonify({"starred": new_val})
+    return jsonify({"starred": new_starred, "no_label": 0 if new_starred else None})
 
 
-# ─── API: Update listing tags (bathtub, AC, dishwasher) ──────────────────────
+# ─── API: Toggle no label ────────────────────────────────────────────────────
+
+@app.route("/api/listings/<listing_id>/no", methods=["POST"])
+def api_toggle_no(listing_id):
+    conn = get_conn()
+    row = conn.execute("SELECT no_label FROM listings WHERE id=?", (listing_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "not found"}), 404
+    new_no_label = 0 if row["no_label"] else 1
+    # Mutual exclusion: marking no clears star
+    if new_no_label:
+        conn.execute("UPDATE listings SET no_label=1, starred=0 WHERE id=?", (listing_id,))
+    else:
+        conn.execute("UPDATE listings SET no_label=0 WHERE id=?", (listing_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"no_label": new_no_label, "starred": 0 if new_no_label else None})
+
+
+
 
 @app.route("/api/listings/<listing_id>/tags", methods=["PATCH"])
 def api_update_tags(listing_id):

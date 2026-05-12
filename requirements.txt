@@ -13,3 +13,4 @@ playwright
 playwright-stealth
 azure-identity
 openai
+Pillow
