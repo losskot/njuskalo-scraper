@@ -45,10 +45,11 @@ DEFAULT_PRICE_MAX = 1200
 
 
 class PipelineRunner:
-    def __init__(self, skip_existing=False, price_min=None, price_max=None, restart=False, fetch_phones=False):
+    def __init__(self, skip_existing=False, price_min=None, price_max=None, lastupdate_min=None, restart=False, fetch_phones=False):
         self.skip_existing = skip_existing
         self.price_min = price_min
         self.price_max = price_max
+        self.lastupdate_min = lastupdate_min
         self.restart = restart
         self.fetch_phones = fetch_phones
         self.start_time = time.time()
@@ -128,6 +129,8 @@ class PipelineRunner:
             extra += ["--price-min", str(self.price_min)]
         if self.price_max is not None:
             extra += ["--price-max", str(self.price_max)]
+        if self.lastupdate_min is not None:
+            extra += ["--lastupdate-min", self.lastupdate_min]
         if self.restart:
             extra += ["--restart"]
         if self.fetch_phones:
@@ -135,8 +138,10 @@ class PipelineRunner:
         desc = 'Download HTML → parse → insert into DB'
         if self.fetch_phones:
             desc = 'Download HTML → parse → fetch phone → insert into DB'
-        if extra:
+        if self.price_min is not None or self.price_max is not None:
             desc += f' (price: {self.price_min or "*"}–{self.price_max or "*"}€)'
+        if self.lastupdate_min:
+            desc += f' (updated ≥ {self.lastupdate_min})'
         return self.run_script('scrape_and_parse.py', 2, desc, extra_args=extra)
 
     def step3_ai_enrich(self):
@@ -242,6 +247,8 @@ def main():
                         help=f'Min price filter in EUR (default: {DEFAULT_PRICE_MIN})')
     parser.add_argument('--price-max', type=int, default=DEFAULT_PRICE_MAX,
                         help=f'Max price filter in EUR (default: {DEFAULT_PRICE_MAX})')
+    parser.add_argument('--lastupdate-min', type=str, default=None,
+                        help='Only fetch listings updated on/after this date (YYYY-MM-DD)')
     parser.add_argument('--restart', action='store_true',
                         help='Ignore checkpoints, re-scan all leaf URLs from scratch')
     parser.add_argument('--fetch-phones', action='store_true', default=False,
@@ -252,6 +259,7 @@ def main():
         skip_existing=args.skip_existing,
         price_min=args.price_min,
         price_max=args.price_max,
+        lastupdate_min=args.lastupdate_min,
         restart=args.restart,
         fetch_phones=args.fetch_phones,
     )

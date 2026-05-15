@@ -38,6 +38,9 @@ CONCURRENT_ENTRIES = 6
 PRICE_MIN = None
 PRICE_MAX = None
 
+# Date filter — only fetch listings updated on/after this date (YYYY-MM-DD, set via CLI)
+LASTUPDATE_MIN = None
+
 # Phone fetching (set via --fetch-phones CLI flag, off by default)
 FETCH_PHONES = False
 
@@ -475,12 +478,14 @@ async def process_entry(session, entry_url, bearer_token, db_conn):
 
 
 def _build_leaf_page_url(leaf_url, page):
-    """Build paginated leaf URL with optional price filters."""
+    """Build paginated leaf URL with optional price and date filters."""
     params = []
     if PRICE_MIN is not None:
         params.append(f"price%5Bmin%5D={PRICE_MIN}")
     if PRICE_MAX is not None:
         params.append(f"price%5Bmax%5D={PRICE_MAX}")
+    if LASTUPDATE_MIN is not None:
+        params.append(f"lastupdate%5Bmin%5D={LASTUPDATE_MIN}")
     if page > 1:
         params.append(f"page={page}")
     if params:
@@ -556,21 +561,26 @@ async def process_leaf_url(session, leaf_url, bearer_token, db_conn):
 
 
 async def main():
-    global PRICE_MIN, PRICE_MAX, FETCH_PHONES
+    global PRICE_MIN, PRICE_MAX, LASTUPDATE_MIN, FETCH_PHONES
     import argparse
     parser = argparse.ArgumentParser(description="Unified scraper: download + parse + phone → DB")
     parser.add_argument("--restart", action="store_true", help="Ignore checkpoints, start from scratch")
     parser.add_argument("--price-min", type=int, default=None, help="Min price filter (EUR)")
     parser.add_argument("--price-max", type=int, default=None, help="Max price filter (EUR)")
+    parser.add_argument("--lastupdate-min", type=str, default=None,
+                        help="Only fetch listings updated on/after this date (YYYY-MM-DD)")
     parser.add_argument("--fetch-phones", action="store_true", default=False,
                         help="Fetch phone numbers via Njuskalo API (requires Playwright, off by default)")
     args = parser.parse_args()
 
     PRICE_MIN = args.price_min
     PRICE_MAX = args.price_max
+    LASTUPDATE_MIN = args.lastupdate_min
     FETCH_PHONES = args.fetch_phones
     if PRICE_MIN or PRICE_MAX:
         log.info(f"Price filter: {PRICE_MIN or '∞'}€ – {PRICE_MAX or '∞'}€")
+    if LASTUPDATE_MIN:
+        log.info(f"Date filter: listings updated on/after {LASTUPDATE_MIN}")
     if FETCH_PHONES:
         log.info("Phone fetching: enabled")
     else:
@@ -601,8 +611,16 @@ async def main():
     leaf_urls = [r[0] for r in rows]
     log.info(f"Found {len(leaf_urls)} leaf URLs to process")
 
-    # Resume from checkpoint
-    checkpoint_key = f"scrape_and_parse_{datetime.now().strftime('%Y-%m-%d')}"
+    # Resume from checkpoint — key includes active filters so changing them starts fresh
+    _filter_parts = []
+    if PRICE_MIN is not None:
+        _filter_parts.append(f"pmin{PRICE_MIN}")
+    if PRICE_MAX is not None:
+        _filter_parts.append(f"pmax{PRICE_MAX}")
+    if LASTUPDATE_MIN is not None:
+        _filter_parts.append(f"lu{LASTUPDATE_MIN}")
+    _filter_suffix = ("_" + "_".join(_filter_parts)) if _filter_parts else ""
+    checkpoint_key = f"scrape_and_parse_{datetime.now().strftime('%Y-%m-%d')}{_filter_suffix}"
     last_idx = 0
     if not args.restart:
         cp = get_checkpoint(db_conn, checkpoint_key)
