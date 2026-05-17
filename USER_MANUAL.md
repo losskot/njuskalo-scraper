@@ -80,6 +80,50 @@ Open **http://127.0.0.1:5000** — map with all listings, filter sidebar, detail
 
 ---
 
+## Bathtub photo classifier (PoC — standalone, not part of pipeline)
+
+`bathtub_classifier.py` is a **proof-of-concept** deep-analysis tool that is **not integrated into the pipeline**. It was run manually on a small sample (46 listings) to evaluate per-photo multi-model classification quality.
+
+### What it does
+- Reads locally downloaded images from `backend/images/{listing_id}/`
+- Sends **each photo individually** to **multiple Azure OpenAI vision models** (up to 8)
+- Classifies each photo into one of: `bathroom_with_bathtub`, `bathroom_with_shower_only`, `bathroom_unclear`, `not_bathroom`
+- Stores per-photo results in a **separate DB**: `backend/bathtub_results.db` (never touches `listings.db`)
+- Uses majority vote across models to determine final per-photo verdict
+
+### How it differs from `ai_enrich.py`
+| | `ai_enrich.py` (pipeline step 3) | `bathtub_classifier.py` (PoC) |
+|---|---|---|
+| Integrated in pipeline | ✅ yes | ❌ no |
+| Granularity | per-listing (yes/no) | per-photo + per-model |
+| Models used | 1 | up to 8 |
+| Output | `listings.db` → `has_bathtub` | `bathtub_results.db` |
+| Coverage (current) | 2,163 listings | 46 listings |
+| Early-exit | ✅ stops at first bathtub found | ❌ classifies all photos |
+
+### Running it manually
+```bash
+# All 8 models on all downloaded images (slow — ~85 hrs total)
+.venv/bin/python3 bathtub_classifier.py
+
+# One model at a time (recommended — resumable)
+.venv/bin/python3 bathtub_classifier.py --models gpt-5-mini
+.venv/bin/python3 bathtub_classifier.py --models gpt-4o
+
+# Limit to N images (for testing)
+.venv/bin/python3 bathtub_classifier.py --limit 50 --models gpt-5-mini
+
+# Regenerate HTML report without re-running inference
+.venv/bin/python3 bathtub_classifier.py --html-only
+```
+
+The script skips already-classified images (`UNIQUE(model, image_path)` constraint), so it is safe to stop and resume at any time.
+
+### Results used in the viewer
+The web viewer's **🛁 Photos panel** reads from `bathtub_results.db` and shows per-photo confirmed bathtub images for listings visible on the map. Currently 21 listings have confirmed bathtub photos (30 photos total).
+
+---
+
 ## Azure proxy deployment (one-time)
 
 Deploy HTTP relay functions across 5 European regions to rotate IPs:
